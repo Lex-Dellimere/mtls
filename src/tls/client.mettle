@@ -200,6 +200,8 @@ export fn mtls_client_start(c: MtlsConn*, host: string) -> int32 {
   if (c->state != MTLS_ST_START) { return MTLS_E_STATE; }
   if (host.length > 255) { return MTLS_E_ARG; }
   if (c->cfg->ngroups == 0 || c->cfg->nsuites == 0) { return MTLS_E_ARG; }
+  // Full verification needs a name to check the certificate against.
+  if (host.length == 0 && c->cfg->verify_mode == MTLS_VERIFY_FULL) { return MTLS_E_ARG; }
   memcpy(&c->host[0], host.chars, (int64)host.length);
   c->hostlen = (int32)host.length;
   if (cr_random_bytes(&c->crand[0], 32) != 0) { return mtls_fail(c, MTLS_E_CRYPTO, -1); }

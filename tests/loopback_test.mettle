@@ -1,24 +1,11 @@
-// Client and server talk to each other in memory: full handshakes,
-// application data both ways, key update, mutual TLS and resumption.
+// Client and server talk to each other in memory: full handshakes with
+// real certificate checks, application data both ways, key update,
+// exporters, resumption, mutual TLS, HelloRetryRequest, and the failures
+// a wrong name, an unknown CA, a wrong pin or a missing client cert cause.
 
 import "std/io";
 import "std/mem";
-import "crypto/core/types";
-import "crypto/ecc/sign";
 import "mtls/mtls";
-
-fn load_key(der: string, k: MtlsPrivKey*) {
-  memset(k, 0, (int64)sizeof(MtlsPrivKey));
-  var pk: CrEd25519Public;
-  var sk: CrEd25519Secret;
-  var seed: CrSeed32;
-  memcpy(&seed.b[0], der.chars + (int64)der.length - 32, 32);
-  cr_ed25519_seed_keypair(&pk, &sk, &seed);
-  k->kind = MTLS_KEY_ED25519;
-  memcpy(&k->sk[0], &sk.b[0], 64);
-  memcpy(&k->pub[0], &pk.b[0], 32);
-  k->publen = 32;
-}
 
 // Bytes in flight in each direction; a side may take only part of what
 // is waiting while it holds unread application data.
@@ -48,25 +35,22 @@ fn pump(a: MtlsConn*, b: MtlsConn*) -> int32 {
   return 1;
 }
 
-fn handshake(ccfg: MtlsConfig*, scfg: MtlsConfig*, cp: MtlsConn**, sp: MtlsConn**) -> int32 {
+fn handshake_host(ccfg: MtlsConfig*, scfg: MtlsConfig*, host: string, cp: MtlsConn**, sp: MtlsConn**) -> int32 {
   g_ablen = 0;
   g_balen = 0;
   var c: MtlsConn* = mtls_client_new(ccfg);
   var s: MtlsConn* = mtls_server_new(scfg);
   *cp = c;
   *sp = s;
-  if (mtls_client_start(c, "server.test") != MTLS_OK) { return 1; }
+  if (mtls_client_start(c, host) != MTLS_OK) { return 1; }
   pump(c, s);
-  if (mtls_conn_handshaking(c) || mtls_conn_handshaking(s)) {
-    println("client err {mtls_conn_error(c)} alert {mtls_conn_alert_sent(c)}/{mtls_conn_alert_received(c)} state {c->state}");
-    println("server err {mtls_conn_error(s)} alert {mtls_conn_alert_sent(s)}/{mtls_conn_alert_received(s)} state {s->state}");
-    return 2;
-  }
-  if (mtls_conn_error(c) != 0 || mtls_conn_error(s) != 0) {
-    println("state c={c->fail_state} s={s->fail_state} err c={mtls_conn_error(c)} s={mtls_conn_error(s)} alerts {mtls_conn_alert_sent(c)} {mtls_conn_alert_sent(s)} {mtls_conn_alert_received(c)} {mtls_conn_alert_received(s)}");
-    return 3;
-  }
+  if (mtls_conn_handshaking(c) || mtls_conn_handshaking(s)) { return 2; }
+  if (mtls_conn_error(c) != 0 || mtls_conn_error(s) != 0) { return 3; }
   return 0;
+}
+
+fn handshake(ccfg: MtlsConfig*, scfg: MtlsConfig*, cp: MtlsConn**, sp: MtlsConn**) -> int32 {
+  return handshake_host(ccfg, scfg, "server.test", cp, sp);
 }
 
 fn echo_check(c: MtlsConn*, s: MtlsConn*) -> int32 {
@@ -93,29 +77,28 @@ fn echo_check(c: MtlsConn*, s: MtlsConn*) -> int32 {
   return 0;
 }
 
-// One full run at a protocol version: handshake, data, (1.3: key update
-// and exporter), close, resumption, mutual TLS, missing client cert.
-fn scenario(v: int32, want_suite: int32) -> int32 {
-  var cert_der: string = import_str "data/tls/server.der";
-  var key_der: string = import_str "data/tls/server.key.der";
-  var ccert_der: string = import_str "data/tls/client.der";
-  var ckey_der: string = import_str "data/tls/client.key.der";
+fn server_cfg(cfg: MtlsConfig*, chain: string, key: string) -> int32 {
+  mtls_config_init(cfg);
+  if (mtls_config_set_cert_pem(cfg, chain.chars, (int64)chain.length, key.chars, (int64)key.length) != MTLS_OK) { return 1; }
+  mtls_config_add_alpn(cfg, "h2");
+  mtls_config_add_alpn(cfg, "http/1.1");
+  return 0;
+}
 
+// One full run at a protocol version against a server certificate.
+fn scenario(v: int32, want_suite: int32, chain: string, key: string, root: string) -> int32 {
+  var ca_pem: string = import_str "data/tls/ca.pem";
+  var ccert: string = import_str "data/tls/client.pem";
+  var ckey: string = import_str "data/tls/client.key";
   var scfg: MtlsConfig;
-  mtls_config_init(&scfg);
-  var key: MtlsPrivKey;
-  load_key(key_der, &key);
-  var chain: MtlsDer[1];
-  chain[0].p = cert_der.chars;
-  chain[0].n = (int64)cert_der.length;
-  if (mtls_config_set_cert(&scfg, &chain[0], 1, &key) != MTLS_OK) { return 1; }
-  mtls_config_add_alpn(&scfg, "h2");
-  mtls_config_add_alpn(&scfg, "http/1.1");
-
+  if (server_cfg(&scfg, chain, key) != 0) { return 1; }
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  if (mtls_roots_add_pem(&roots, root.chars, (int64)root.length) != 1) { return 2; }
   var ccfg: MtlsConfig;
   mtls_config_init(&ccfg);
   ccfg.max_version = v;
-  ccfg.verify_mode = MTLS_VERIFY_NONE;
+  ccfg.roots = &roots;
   mtls_config_add_alpn(&ccfg, "http/1.1");
   var cache: MtlsSessionCache* = mtls_cache_new();
   ccfg.cache = cache;
@@ -126,7 +109,7 @@ fn scenario(v: int32, want_suite: int32) -> int32 {
   if (rc != 0) { return 10 + rc; }
   if (mtls_conn_version(c) != v || mtls_conn_version(s) != v || mtls_conn_suite(c) != want_suite) { return 20; }
   if (mtls_conn_alpn(c) != "http/1.1" || mtls_conn_alpn(s) != "http/1.1") { return 21; }
-  if (mtls_conn_server_name(s) != "server.test") { return 22; }
+  if (mtls_conn_server_name(s) != "server.test" || !mtls_conn_peer_verified(c)) { return 22; }
   rc = echo_check(c, s);
   if (rc != 0) { return 30 + rc; }
   if (v == MTLS_TLS13) {
@@ -147,6 +130,7 @@ fn scenario(v: int32, want_suite: int32) -> int32 {
   mtls_conn_free(c);
   mtls_conn_free(s);
 
+  // Resumption with the ticket from the first connection.
   var c2: MtlsConn* = (MtlsConn*)0;
   var s2: MtlsConn* = (MtlsConn*)0;
   rc = handshake(&ccfg, &scfg, &c2, &s2);
@@ -157,26 +141,26 @@ fn scenario(v: int32, want_suite: int32) -> int32 {
   mtls_conn_free(c2);
   mtls_conn_free(s2);
 
+  // Mutual TLS: the server checks the client against the Ed25519 CA.
+  var croots: MtlsRoots;
+  mtls_roots_init(&croots);
+  mtls_roots_add_pem(&croots, ca_pem.chars, (int64)ca_pem.length);
   scfg.client_auth = MTLS_CLIENT_AUTH_REQUIRE;
-  scfg.verify_mode = MTLS_VERIFY_NONE;
-  var ckey: MtlsPrivKey;
-  load_key(ckey_der, &ckey);
-  var cchain: MtlsDer[1];
-  cchain[0].p = ccert_der.chars;
-  cchain[0].n = (int64)ccert_der.length;
-  mtls_config_set_cert(&ccfg, &cchain[0], 1, &ckey);
-  ccfg.cache = (rawptr)0;
+  scfg.roots = &croots;
+  if (mtls_config_set_cert_pem(&ccfg, ccert.chars, (int64)ccert.length, ckey.chars, (int64)ckey.length) != MTLS_OK) { return 79; }
+  ccfg.cache = (MtlsSessionCache*)0;
   var c3: MtlsConn* = (MtlsConn*)0;
   var s3: MtlsConn* = (MtlsConn*)0;
   rc = handshake(&ccfg, &scfg, &c3, &s3);
   if (rc != 0) { return 80 + rc; }
-  if (mtls_conn_peer_cert_count(s3) != 1) { return 90; }
+  if (mtls_conn_peer_cert_count(s3) != 1 || !mtls_conn_peer_verified(s3)) { return 90; }
   rc = echo_check(c3, s3);
   if (rc != 0) { return 90 + rc; }
   mtls_conn_free(c3);
   mtls_conn_free(s3);
 
-  ccfg.has_key = false;
+  // No client certificate where one is required.
+  mtls_config_free(&ccfg);
   var c4: MtlsConn* = (MtlsConn*)0;
   var s4: MtlsConn* = (MtlsConn*)0;
   rc = handshake(&ccfg, &scfg, &c4, &s4);
@@ -187,20 +171,106 @@ fn scenario(v: int32, want_suite: int32) -> int32 {
   mtls_conn_free(c4);
   mtls_conn_free(s4);
   mtls_cache_free(cache);
+  mtls_config_free(&scfg);
+  mtls_roots_free(&roots);
+  mtls_roots_free(&croots);
+  return 0;
+}
+
+// Handshakes that must fail, and the HelloRetryRequest path.
+fn edge_cases() -> int32 {
+  var chain: string = import_str "data/tls/ecserver-chain.pem";
+  var key: string = import_str "data/tls/ecserver.key";
+  var ecroot: string = import_str "data/tls/ecroot.pem";
+  var edca: string = import_str "data/tls/ca.pem";
+  var scfg: MtlsConfig;
+  if (server_cfg(&scfg, chain, key) != 0) { return 1; }
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  mtls_roots_add_pem(&roots, ecroot.chars, (int64)ecroot.length);
+  var ccfg: MtlsConfig;
+  mtls_config_init(&ccfg);
+  ccfg.roots = &roots;
+  var c: MtlsConn* = (MtlsConn*)0;
+  var s: MtlsConn* = (MtlsConn*)0;
+
+  // Wildcard name: *.server.test covers a.server.test.
+  if (handshake_host(&ccfg, &scfg, "a.server.test", &c, &s) != 0) { return 2; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  // Wrong name.
+  if (handshake_host(&ccfg, &scfg, "other.test", &c, &s) == 0) { return 3; }
+  if (mtls_conn_cert_error(c) != MTLS_CV_NAME_MISMATCH || mtls_conn_alert_received(s) != MTLS_ALERT_BAD_CERTIFICATE) {
+    println("detail {mtls_conn_cert_error(c)} alert {mtls_conn_alert_received(s)} {mtls_conn_alert_sent(c)}");
+    return 4;
+  }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  // A CA we do not trust.
+  var other: MtlsRoots;
+  mtls_roots_init(&other);
+  mtls_roots_add_pem(&other, edca.chars, (int64)edca.length);
+  ccfg.roots = &other;
+  if (handshake(&ccfg, &scfg, &c, &s) == 0) { return 5; }
+  if (mtls_conn_alert_received(s) != MTLS_ALERT_UNKNOWN_CA) { return 6; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  ccfg.roots = &roots;
+  // Pinned key: only the leaf's public key matters.
+  var leaf: MtlsCert;
+  if (mtls_cert_parse(&leaf, scfg.chain[0].p, scfg.chain[0].n) != MTLS_OK) { return 7; }
+  ccfg.verify_mode = MTLS_VERIFY_PIN;
+  mtls_cert_spki_sha256(&leaf, &ccfg.pin[0]);
+  if (handshake_host(&ccfg, &scfg, "", &c, &s) != 0) { return 8; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  ccfg.pin[0] = ccfg.pin[0] ^ (uint8)1;
+  if (handshake(&ccfg, &scfg, &c, &s) == 0) { return 9; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  ccfg.verify_mode = MTLS_VERIFY_FULL;
+  // Full verification refuses to start without a host name.
+  c = mtls_client_new(&ccfg);
+  if (mtls_client_start(c, "") != MTLS_E_ARG) { return 10; }
+  mtls_conn_free(c);
+  // HelloRetryRequest: the client's first share is X25519, the server
+  // only takes P-256.
+  scfg.groups[0] = MTLS_GROUP_SECP256R1;
+  scfg.ngroups = 1;
+  if (handshake(&ccfg, &scfg, &c, &s) != 0) { return 11; }
+  if (!c->hrr_done || c->group != MTLS_GROUP_SECP256R1) { return 12; }
+  if (echo_check(c, s) != 0) { return 13; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  // TLS 1.2 with P-256 ECDHE.
+  ccfg.max_version = MTLS_TLS12;
+  if (handshake(&ccfg, &scfg, &c, &s) != 0) { return 14; }
+  if (c->group != MTLS_GROUP_SECP256R1) { return 15; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  mtls_config_free(&scfg);
+  mtls_roots_free(&roots);
+  mtls_roots_free(&other);
   return 0;
 }
 
 fn main() -> int32 {
-  var rc: int32 = scenario(MTLS_TLS13, 0x1301);
-  if (rc != 0) {
-    println("TLS 1.3 failed at {rc}");
-    return rc;
-  }
-  rc = scenario(MTLS_TLS12, 0xc02b);
-  if (rc != 0) {
-    println("TLS 1.2 failed at {rc}");
-    return 200 + rc;
-  }
+  var ed_chain: string = import_str "data/tls/server.pem";
+  var ed_key: string = import_str "data/tls/server.key";
+  var ed_root: string = import_str "data/tls/ca.pem";
+  var ec_chain: string = import_str "data/tls/ecserver-chain.pem";
+  var ec_key: string = import_str "data/tls/ecserver.key";
+  var ec_root: string = import_str "data/tls/ecroot.pem";
+  var rc: int32 = scenario(MTLS_TLS13, 0x1301, ed_chain, ed_key, ed_root);
+  if (rc != 0) { println("TLS 1.3 Ed25519 failed at {rc}"); return 1; }
+  rc = scenario(MTLS_TLS12, 0xc02b, ed_chain, ed_key, ed_root);
+  if (rc != 0) { println("TLS 1.2 Ed25519 failed at {rc}"); return 2; }
+  rc = scenario(MTLS_TLS13, 0x1301, ec_chain, ec_key, ec_root);
+  if (rc != 0) { println("TLS 1.3 P-256 failed at {rc}"); return 3; }
+  rc = scenario(MTLS_TLS12, 0xc02b, ec_chain, ec_key, ec_root);
+  if (rc != 0) { println("TLS 1.2 P-256 failed at {rc}"); return 4; }
+  rc = edge_cases();
+  if (rc != 0) { println("edge cases failed at {rc}"); return 5; }
   println("loopback ok");
   return 0;
 }

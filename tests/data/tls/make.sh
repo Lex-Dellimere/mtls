@@ -17,3 +17,18 @@ for who in server client; do
 done
 openssl x509 -in ca.pem -outform DER -out ca.der
 rm -f ca.srl
+
+# P-256: root -> intermediate -> server, so chains longer than one are tested.
+openssl ecparam -name prime256v1 -genkey -noout -out ecroot.key
+openssl req -x509 -new -key ecroot.key -subj "/CN=mtls test EC root" -days 36500 \
+  -addext "basicConstraints=critical,CA:true" -addext "keyUsage=critical,keyCertSign" -out ecroot.pem
+openssl ecparam -name prime256v1 -genkey -noout -out ecinter.key
+openssl req -new -key ecinter.key -subj "/CN=mtls test EC intermediate" -out ecinter.csr
+printf "basicConstraints=critical,CA:true,pathlen:0\nkeyUsage=critical,keyCertSign\n" > ecinter.ext
+openssl x509 -req -in ecinter.csr -CA ecroot.pem -CAkey ecroot.key -CAcreateserial -days 36500 -extfile ecinter.ext -out ecinter.pem
+openssl ecparam -name prime256v1 -genkey -noout -out ecserver.key
+openssl req -new -key ecserver.key -subj "/CN=server.test" -out ecserver.csr
+printf "subjectAltName=DNS:server.test,DNS:*.server.test\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:false\n" > ecserver.ext
+openssl x509 -req -in ecserver.csr -CA ecinter.pem -CAkey ecinter.key -CAcreateserial -days 36500 -extfile ecserver.ext -out ecserver.pem
+cat ecserver.pem ecinter.pem > ecserver-chain.pem
+rm -f *.csr *.ext *.srl ecinter.key ecroot.key

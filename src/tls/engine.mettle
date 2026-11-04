@@ -356,6 +356,14 @@ export fn mtls_conn_peer_cert(c: MtlsConn*, i: int32) -> MtlsDer {
 
 export fn mtls_conn_peer_cert_count(c: MtlsConn*) -> int32 { return c->npchain; }
 
+/// mtls_conn_cert_error: why the peer's certificate was refused, as an
+/// MTLS_CV_* code (mtls_cv_text gives the words); 0 if it was not.
+export fn mtls_conn_cert_error(c: MtlsConn*) -> int32 { return c->cert_detail; }
+
+/// mtls_conn_peer_verified: true when the peer's chain was checked and
+/// accepted (false with MTLS_VERIFY_NONE, or when the peer sent none).
+export fn mtls_conn_peer_verified(c: MtlsConn*) -> bool { return c->peer_verified; }
+
 /// mtls_conn_export: keying material for another protocol (RFC 8446 7.5).
 export fn mtls_conn_export(c: MtlsConn*, label: string, ctx: uint8*, clen: int64, out: uint8*, olen: int64) -> int32 {
   if (!c->hs_done || c->err != 0) { return MTLS_E_STATE; }

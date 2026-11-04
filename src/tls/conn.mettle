@@ -159,6 +159,7 @@ export struct MtlsConn {
   npchain: int32;
   peer_key: MtlsPubKey;
   peer_verified: bool;
+  cert_detail: int32;     // why the peer's certificate was refused (MTLS_CV_*)
   // client auth
   cert_requested: bool;   // client: the server asked; server: we asked
   creq_ctx: uint8[255];
@@ -273,6 +274,11 @@ export fn mtls_fail(c: MtlsConn*, code: int32, desc: int32) -> int32 {
   c->state = MTLS_ST_FAILED;
   if (desc >= 0 && !c->we_closed) {
     c->alert_sent = desc;
+    // A TLS 1.3 client that already has handshake keys sends the alert
+    // under them: the server reads only protected records by then.
+    if (c->is_client && c->version == MTLS_TLS13 && c->rd.on && !c->wr.on) {
+      mtls_dir_set13(&c->wr, &c->suite, &c->c_hs[0]);
+    }
     var a: uint8[2];
     a[0] = 2;
     a[1] = (uint8)desc;

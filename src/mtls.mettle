@@ -6,6 +6,7 @@ import "mtls/crypto/hash";
 import "mtls/crypto/aead";
 import "mtls/crypto/kx";
 import "mtls/crypto/sig";
+import "mtls/x509/x509";
 import "mtls/tls/consts";
 import "mtls/tls/config";
 import "mtls/tls/conn";

@@ -9,6 +9,9 @@ import "mtls/crypto/sig";
 import "mtls/crypto/kx";
 import "mtls/crypto/aead";
 import "mtls/tls/consts";
+import "mtls/x509/verify";
+import "mtls/x509/key";
+import "mtls/x509/rootfile";
 
 // How the peer's certificate is checked.
 export const MTLS_VERIFY_FULL: int32 = 0;  // chain to a trusted root, plus host name for clients
@@ -39,9 +42,9 @@ export struct MtlsConfig {
   nsigs: int32;
   alpn: string[8];
   nalpn: int32;
-  // Trust: MtlsRoots* (see x509/verify). Clients check servers with
-  // roots; servers check client certificates with roots too.
-  roots: rawptr;
+  // Trust: clients check servers against roots, servers check client
+  // certificates against roots. Not owned by the config.
+  roots: MtlsRoots*;
   verify_mode: int32;
   pin: uint8[32];
   // Our own certificate chain (leaf first, DER) and its key.
@@ -49,6 +52,7 @@ export struct MtlsConfig {
   nchain: int32;
   key: MtlsPrivKey;
   has_key: bool;
+  owned_chain: MtlsCertList;   // set by the _pem and _files loaders
   client_auth: int32;
   // Resumption. Servers seal tickets with ticket_key; clients keep
   // sessions in cache (an MtlsSessionCache*, 0 for none).
@@ -128,7 +132,8 @@ export fn mtls_config_set_suites(cfg: MtlsConfig*, ids: int32*, n: int32) -> int
 }
 
 /// mtls_config_set_cert: our certificate chain (leaf first, DER; the
-/// bytes must outlive the config) and private key (copied).
+/// bytes must outlive the config) and private key. The key moves into the
+/// config: mtls_config_free wipes it, so do not free it yourself.
 export fn mtls_config_set_cert(cfg: MtlsConfig*, chain: MtlsDer*, n: int32, key: MtlsPrivKey*) -> int32 {
   if (n < 1 || n > MTLS_MAX_CHAIN) { return MTLS_E_ARG; }
   for i in 0..n { cfg->chain[i] = chain[i]; }
@@ -157,4 +162,66 @@ export fn mtls_config_has_sig(cfg: MtlsConfig*, s: int32) -> bool {
     if (cfg->sigs[i] == s) { return true; }
   }
   return false;
+}
+
+/// mtls_config_set_cert_pem: our certificate chain from PEM text (leaf
+/// first, as servers send it) and the private key from PEM text (PKCS#8,
+/// SEC 1 or PKCS#1). The config keeps copies; free with mtls_config_free.
+export fn mtls_config_set_cert_pem(cfg: MtlsConfig*, chain: uint8*, n: int64, key: uint8*, kn: int64) -> int32 {
+  var k: MtlsPrivKey;
+  var rc: int32 = mtls_key_load(key, kn, &k);
+  if (rc != MTLS_OK) { return rc; }
+  var l: MtlsCertList;
+  var cnt: int32 = mtls_certlist_from_pem(&l, chain, n);
+  if (cnt <= 0) {
+    mtls_privkey_free(&k);
+    return MTLS_E_DECODE;
+  }
+  if (cnt > MTLS_MAX_CHAIN) {
+    mtls_certlist_free(&l);
+    mtls_privkey_free(&k);
+    return MTLS_E_SPACE;
+  }
+  mtls_config_free(cfg);
+  cfg->owned_chain = l;
+  for i in 0..cnt {
+    cfg->chain[i].p = l.refs[i].p;
+    cfg->chain[i].n = l.refs[i].n;
+  }
+  cfg->nchain = cnt;
+  cfg->key = k;
+  cfg->has_key = true;
+  return MTLS_OK;
+}
+
+/// mtls_config_load_cert_files: mtls_config_set_cert_pem from two files.
+export fn mtls_config_load_cert_files(cfg: MtlsConfig*, chain_path: string, key_path: string) -> int32 {
+  var cp: uint8* = (uint8*)0;
+  var cn: int64 = 0;
+  var rc: int32 = mtls_file_read(chain_path, &cp, &cn);
+  if (rc != MTLS_OK) { return rc; }
+  var kp: uint8* = (uint8*)0;
+  var kn: int64 = 0;
+  rc = mtls_file_read(key_path, &kp, &kn);
+  if (rc != MTLS_OK) {
+    free(cp);
+    return rc;
+  }
+  rc = mtls_config_set_cert_pem(cfg, cp, cn, kp, kn);
+  free(cp);
+  cr_wipe(kp, kn);
+  free(kp);
+  return rc;
+}
+
+/// mtls_config_free: releases what the loaders allocated and wipes the key.
+/// The config can be loaded again afterwards.
+export fn mtls_config_free(cfg: MtlsConfig*) {
+  if (cfg->owned_chain.count > 0 || cfg->owned_chain.buf != 0) {
+    mtls_certlist_free(&cfg->owned_chain);
+    memset(&cfg->owned_chain, 0, (int64)sizeof(MtlsCertList));
+  }
+  if (cfg->has_key) { mtls_privkey_free(&cfg->key); }
+  cfg->has_key = false;
+  cfg->nchain = 0;
 }
