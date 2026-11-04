@@ -1,0 +1,206 @@
+// Client and server talk to each other in memory: full handshakes,
+// application data both ways, key update, mutual TLS and resumption.
+
+import "std/io";
+import "std/mem";
+import "crypto/core/types";
+import "crypto/ecc/sign";
+import "mtls/mtls";
+
+fn load_key(der: string, k: MtlsPrivKey*) {
+  memset(k, 0, (int64)sizeof(MtlsPrivKey));
+  var pk: CrEd25519Public;
+  var sk: CrEd25519Secret;
+  var seed: CrSeed32;
+  memcpy(&seed.b[0], der.chars + (int64)der.length - 32, 32);
+  cr_ed25519_seed_keypair(&pk, &sk, &seed);
+  k->kind = MTLS_KEY_ED25519;
+  memcpy(&k->sk[0], &sk.b[0], 64);
+  memcpy(&k->pub[0], &pk.b[0], 32);
+  k->publen = 32;
+}
+
+// Bytes in flight in each direction; a side may take only part of what
+// is waiting while it holds unread application data.
+var g_ab: uint8[262144];
+var g_ablen: int64 = 0;
+var g_ba: uint8[262144];
+var g_balen: int64 = 0;
+
+fn move(from: MtlsConn*, to: MtlsConn*, buf: uint8*, len: int64*) -> bool {
+  var n: int64 = mtls_conn_take_out(from, buf + *len, 262144 - *len);
+  *len = *len + n;
+  if (*len == 0) { return n > 0; }
+  var k: int64 = mtls_conn_feed(to, buf, *len);
+  if (k <= 0) { return n > 0; }
+  memmove(buf, buf + k, *len - k);
+  *len = *len - k;
+  return true;
+}
+
+// Moves bytes both ways until nothing moves.
+fn pump(a: MtlsConn*, b: MtlsConn*) -> int32 {
+  for round in 0..1000 {
+    var m1: bool = move(a, b, &g_ab[0], &g_ablen);
+    var m2: bool = move(b, a, &g_ba[0], &g_balen);
+    if (!m1 && !m2) { return 0; }
+  }
+  return 1;
+}
+
+fn handshake(ccfg: MtlsConfig*, scfg: MtlsConfig*, cp: MtlsConn**, sp: MtlsConn**) -> int32 {
+  g_ablen = 0;
+  g_balen = 0;
+  var c: MtlsConn* = mtls_client_new(ccfg);
+  var s: MtlsConn* = mtls_server_new(scfg);
+  *cp = c;
+  *sp = s;
+  if (mtls_client_start(c, "server.test") != MTLS_OK) { return 1; }
+  pump(c, s);
+  if (mtls_conn_handshaking(c) || mtls_conn_handshaking(s)) {
+    println("client err {mtls_conn_error(c)} alert {mtls_conn_alert_sent(c)}/{mtls_conn_alert_received(c)} state {c->state}");
+    println("server err {mtls_conn_error(s)} alert {mtls_conn_alert_sent(s)}/{mtls_conn_alert_received(s)} state {s->state}");
+    return 2;
+  }
+  if (mtls_conn_error(c) != 0 || mtls_conn_error(s) != 0) {
+    println("state c={c->fail_state} s={s->fail_state} err c={mtls_conn_error(c)} s={mtls_conn_error(s)} alerts {mtls_conn_alert_sent(c)} {mtls_conn_alert_sent(s)} {mtls_conn_alert_received(c)} {mtls_conn_alert_received(s)}");
+    return 3;
+  }
+  return 0;
+}
+
+fn echo_check(c: MtlsConn*, s: MtlsConn*) -> int32 {
+  var msg: string = "ping over tls";
+  if (mtls_conn_write(c, msg.chars, (int64)msg.length) != (int64)msg.length) { return 1; }
+  pump(c, s);
+  var got: uint8[64];
+  var n: int64 = mtls_conn_read(s, &got[0], 64);
+  if (n != (int64)msg.length || memcmp(&got[0], msg.chars, n) != 0) { return 2; }
+  // A large write spans several records.
+  var big: uint8[50000];
+  for i in 0..50000 { big[i] = (uint8)(i * 7); }
+  if (mtls_conn_write(s, &big[0], 50000) != 50000) { return 3; }
+  pump(c, s);
+  var back: uint8[50000];
+  var total: int64 = 0;
+  while (total < 50000) {
+    var k: int64 = mtls_conn_read(c, &back[total], 50000 - total);
+    if (k <= 0) { return 4; }
+    total = total + k;
+    pump(c, s);
+  }
+  if (memcmp(&big[0], &back[0], 50000) != 0) { return 5; }
+  return 0;
+}
+
+// One full run at a protocol version: handshake, data, (1.3: key update
+// and exporter), close, resumption, mutual TLS, missing client cert.
+fn scenario(v: int32, want_suite: int32) -> int32 {
+  var cert_der: string = import_str "data/tls/server.der";
+  var key_der: string = import_str "data/tls/server.key.der";
+  var ccert_der: string = import_str "data/tls/client.der";
+  var ckey_der: string = import_str "data/tls/client.key.der";
+
+  var scfg: MtlsConfig;
+  mtls_config_init(&scfg);
+  var key: MtlsPrivKey;
+  load_key(key_der, &key);
+  var chain: MtlsDer[1];
+  chain[0].p = cert_der.chars;
+  chain[0].n = (int64)cert_der.length;
+  if (mtls_config_set_cert(&scfg, &chain[0], 1, &key) != MTLS_OK) { return 1; }
+  mtls_config_add_alpn(&scfg, "h2");
+  mtls_config_add_alpn(&scfg, "http/1.1");
+
+  var ccfg: MtlsConfig;
+  mtls_config_init(&ccfg);
+  ccfg.max_version = v;
+  ccfg.verify_mode = MTLS_VERIFY_NONE;
+  mtls_config_add_alpn(&ccfg, "http/1.1");
+  var cache: MtlsSessionCache* = mtls_cache_new();
+  ccfg.cache = cache;
+
+  var c: MtlsConn* = (MtlsConn*)0;
+  var s: MtlsConn* = (MtlsConn*)0;
+  var rc: int32 = handshake(&ccfg, &scfg, &c, &s);
+  if (rc != 0) { return 10 + rc; }
+  if (mtls_conn_version(c) != v || mtls_conn_version(s) != v || mtls_conn_suite(c) != want_suite) { return 20; }
+  if (mtls_conn_alpn(c) != "http/1.1" || mtls_conn_alpn(s) != "http/1.1") { return 21; }
+  if (mtls_conn_server_name(s) != "server.test") { return 22; }
+  rc = echo_check(c, s);
+  if (rc != 0) { return 30 + rc; }
+  if (v == MTLS_TLS13) {
+    if (mtls_conn_key_update(c, true) != MTLS_OK) { return 40; }
+    pump(c, s);
+    rc = echo_check(c, s);
+    if (rc != 0) { return 40 + rc; }
+    var e1: uint8[32];
+    var e2: uint8[32];
+    mtls_conn_export(c, "EXPORTER-test", (uint8*)0, 0, &e1[0], 32);
+    mtls_conn_export(s, "EXPORTER-test", (uint8*)0, 0, &e2[0], 32);
+    if (memcmp(&e1[0], &e2[0], 32) != 0) { return 48; }
+  }
+  mtls_conn_close(c);
+  pump(c, s);
+  var tmp: uint8[8];
+  if (mtls_conn_read(s, &tmp[0], 8) != 0) { return 50; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+
+  var c2: MtlsConn* = (MtlsConn*)0;
+  var s2: MtlsConn* = (MtlsConn*)0;
+  rc = handshake(&ccfg, &scfg, &c2, &s2);
+  if (rc != 0) { return 60 + rc; }
+  if (!mtls_conn_resumed(c2) || !mtls_conn_resumed(s2)) { return 70; }
+  rc = echo_check(c2, s2);
+  if (rc != 0) { return 70 + rc; }
+  mtls_conn_free(c2);
+  mtls_conn_free(s2);
+
+  scfg.client_auth = MTLS_CLIENT_AUTH_REQUIRE;
+  scfg.verify_mode = MTLS_VERIFY_NONE;
+  var ckey: MtlsPrivKey;
+  load_key(ckey_der, &ckey);
+  var cchain: MtlsDer[1];
+  cchain[0].p = ccert_der.chars;
+  cchain[0].n = (int64)ccert_der.length;
+  mtls_config_set_cert(&ccfg, &cchain[0], 1, &ckey);
+  ccfg.cache = (rawptr)0;
+  var c3: MtlsConn* = (MtlsConn*)0;
+  var s3: MtlsConn* = (MtlsConn*)0;
+  rc = handshake(&ccfg, &scfg, &c3, &s3);
+  if (rc != 0) { return 80 + rc; }
+  if (mtls_conn_peer_cert_count(s3) != 1) { return 90; }
+  rc = echo_check(c3, s3);
+  if (rc != 0) { return 90 + rc; }
+  mtls_conn_free(c3);
+  mtls_conn_free(s3);
+
+  ccfg.has_key = false;
+  var c4: MtlsConn* = (MtlsConn*)0;
+  var s4: MtlsConn* = (MtlsConn*)0;
+  rc = handshake(&ccfg, &scfg, &c4, &s4);
+  if (rc == 0) { return 100; }
+  var want_alert: int32 = MTLS_ALERT_CERTIFICATE_REQUIRED;
+  if (v == MTLS_TLS12) { want_alert = MTLS_ALERT_HANDSHAKE_FAILURE; }
+  if (mtls_conn_alert_sent(s4) != want_alert) { return 101; }
+  mtls_conn_free(c4);
+  mtls_conn_free(s4);
+  mtls_cache_free(cache);
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = scenario(MTLS_TLS13, 0x1301);
+  if (rc != 0) {
+    println("TLS 1.3 failed at {rc}");
+    return rc;
+  }
+  rc = scenario(MTLS_TLS12, 0xc02b);
+  if (rc != 0) {
+    println("TLS 1.2 failed at {rc}");
+    return 200 + rc;
+  }
+  println("loopback ok");
+  return 0;
+}

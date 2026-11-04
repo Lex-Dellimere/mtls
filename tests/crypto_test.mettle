@@ -1,0 +1,86 @@
+// Known-answer tests for the hash, HMAC, HKDF and HKDF-Expand-Label glue.
+
+import "std/io";
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+
+fn hexval(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return 0;
+}
+
+fn unhex(s: string, out: uint8*) -> int64 {
+  var n: int64 = (int64)s.length / 2;
+  for i in 0..n {
+    out[i] = (uint8)(hexval((int32)s[i * 2]) * 16 + hexval((int32)s[i * 2 + 1]));
+  }
+  return n;
+}
+
+fn same(a: uint8*, hex: string) -> bool {
+  var b: uint8[256];
+  var n: int64 = unhex(hex, &b[0]);
+  return memcmp(a, &b[0], n) == 0;
+}
+
+fn main() -> int32 {
+  var out: uint8[64];
+  var abc: string = "abc";
+  mtls_hash(MTLS_SHA256, abc.chars, 3, &out[0]);
+  if (!same(&out[0], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")) { return 1; }
+  mtls_hash(MTLS_SHA384, abc.chars, 3, &out[0]);
+  if (!same(&out[0], "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7")) { return 2; }
+
+  // RFC 4231 test case 2 (HMAC-SHA256 and SHA-384, key "Jefe").
+  var key: string = "Jefe";
+  var msg: string = "what do ya want for nothing?";
+  mtls_hmac(MTLS_SHA256, key.chars, 4, msg.chars, (int64)msg.length, &out[0]);
+  if (!same(&out[0], "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")) { return 3; }
+  mtls_hmac(MTLS_SHA384, key.chars, 4, msg.chars, (int64)msg.length, &out[0]);
+  if (!same(&out[0], "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649")) { return 4; }
+
+  // RFC 5869 test case 1.
+  var ikm: uint8[22];
+  for i in 0..22 { ikm[i] = 11; }
+  var salt: uint8[16];
+  var sl: int64 = unhex("000102030405060708090a0b0c", &salt[0]);
+  var info: uint8[16];
+  var il: int64 = unhex("f0f1f2f3f4f5f6f7f8f9", &info[0]);
+  var prk: uint8[32];
+  mtls_hkdf_extract(MTLS_SHA256, &salt[0], sl, &ikm[0], 22, &prk[0]);
+  if (!same(&prk[0], "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")) { return 5; }
+  var okm: uint8[42];
+  if (mtls_hkdf_expand(MTLS_SHA256, &prk[0], 32, &info[0], il, &okm[0], 42) != MTLS_OK) { return 6; }
+  if (!same(&okm[0], "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")) { return 7; }
+
+  // RFC 8448 simple 1-RTT: early secret, then "derived".
+  var zero: uint8[32];
+  memset(&zero[0], 0, 32);
+  var early: uint8[32];
+  mtls_hkdf_extract(MTLS_SHA256, &zero[0], 0, &zero[0], 32, &early[0]);
+  if (!same(&early[0], "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")) { return 8; }
+  var empty_hash: uint8[32];
+  mtls_hash(MTLS_SHA256, &zero[0], 0, &empty_hash[0]);
+  var derived: uint8[32];
+  mtls_derive_secret(MTLS_SHA256, &early[0], "derived", &empty_hash[0], &derived[0]);
+  if (!same(&derived[0], "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")) { return 9; }
+
+  // Writer and reader round trip, and the sticky error.
+  var buf: uint8[16];
+  var w: MtlsWr = mtls_wr(&buf[0], 16);
+  var m: int64 = mtls_wr_open16(&w);
+  mtls_wr_u24(&w, 0x010203);
+  mtls_wr_close16(&w, m);
+  if (w.bad || w.len != 5) { return 10; }
+  var r: MtlsRd = mtls_rd(&buf[0], w.len);
+  var v: MtlsRd = mtls_rd_vec16(&r);
+  if (mtls_rd_u24(&v) != 0x010203 || !mtls_rd_ok_end(&r) || !mtls_rd_ok_end(&v)) { return 11; }
+  var r2: MtlsRd = mtls_rd(&buf[0], 3);
+  var v2: MtlsRd = mtls_rd_vec16(&r2);
+  if (!v2.bad || !r2.bad || mtls_rd_u8(&v2) != 0) { return 12; }
+  println("crypto ok");
+  return 0;
+}

@@ -1,0 +1,315 @@
+// Certificate parsing: the system CA bundle, the openssl fixtures (Ed25519,
+// ECDSA, RSA), extensions, malformed certificates, and host name matching.
+
+import "std/io";
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/sig";
+import "mtls/x509/x509";
+import "data/x509/fixtures";
+
+// Parses the first block of a PEM fixture into buf and then into c.
+fn load(pem: string, buf: uint8*, c: MtlsCert*) -> int32 {
+  var n: int64 = mtls_t_pem_der(pem, buf, 4096);
+  if (n < 0) { return MTLS_E_DECODE; }
+  return mtls_cert_parse(c, buf, n);
+}
+
+fn t_system_bundle() -> int32 {
+  var fp: cstring = fopen("/etc/ssl/certs/ca-certificates.crt", "rb");
+  if (fp == 0) {
+    println("no /etc/ssl/certs/ca-certificates.crt, skipping the bundle check");
+    return 0;
+  }
+  var cap: int64 = 4 * 1024 * 1024;
+  var buf: uint8* = malloc(cap);
+  if (buf == 0) { fclose(fp); return 1; }
+  var got: int64 = fread(buf, 1, cap, fp);
+  fclose(fp);
+  var it: MtlsPemIter;
+  var blk: MtlsPemBlock;
+  mtls_pem_iter(&it, buf, got);
+  var ok: int32 = 0;
+  var unusable_sig: int32 = 0;
+  var unusable_key: int32 = 0;
+  var rc: int32 = 0;
+  while (true) {
+    var r: int32 = mtls_pem_next(&it, &blk);
+    if (r == 0) { break; }
+    if (r < 0) { rc = 2; break; }
+    var der: uint8* = 0;
+    var dl: int64 = 0;
+    if (mtls_pem_decode_alloc(&blk, &der, &dl) != MTLS_OK) { rc = 3; break; }
+    var c: MtlsCert;
+    if (mtls_cert_parse(&c, der, dl) != MTLS_OK) {
+      println("bundle: does not parse: {blk.label} ({dl} bytes)");
+      rc = 4;
+    } else {
+      ok = ok + 1;
+      if (c.sig_key == MTLS_KEY_NONE) { unusable_sig = unusable_sig + 1; }
+      if (c.pub.kind == MTLS_KEY_NONE) { unusable_key = unusable_key + 1; }
+      if (!c.self_issued) { rc = 5; }
+      if (c.not_after <= c.not_before) { rc = 6; }
+    }
+    free(der);
+    if (rc != 0) { break; }
+  }
+  free(buf);
+  println("bundle: {ok} certificates parsed ({unusable_sig} with a signature algorithm we do not use, {unusable_key} with an unusable key)");
+  if (rc != 0) { return rc; }
+  if (ok < 10) { return 7; }
+  // The same bundle through the trust store.
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  var n: int32 = mtls_roots_load_system(&roots);
+  if (n < 1 || roots.count != n) { return 8; }
+  mtls_roots_free(&roots);
+  return 0;
+}
+
+fn t_ed25519() -> int32 {
+  var b1: uint8[4096];
+  var b2: uint8[4096];
+  var b3: uint8[4096];
+  var root: MtlsCert;
+  var inter: MtlsCert;
+  var leaf: MtlsCert;
+  if (load(MTLS_T_ROOT_PEM, &b1[0], &root) != MTLS_OK) { return 1; }
+  if (load(MTLS_T_INTER_PEM, &b2[0], &inter) != MTLS_OK) { return 2; }
+  if (load(MTLS_T_LEAF_PEM, &b3[0], &leaf) != MTLS_OK) { return 3; }
+  if (leaf.version != 3 || root.version != 3) { return 4; }
+  if (!root.self_issued || inter.self_issued || leaf.self_issued) { return 5; }
+  if (!mtls_bytes_eq(leaf.issuer, leaf.issuerlen, inter.subject, inter.subjectlen)) { return 6; }
+  if (!mtls_bytes_eq(inter.issuer, inter.issuerlen, root.subject, root.subjectlen)) { return 7; }
+  if (mtls_bytes_eq(leaf.subject, leaf.subjectlen, inter.subject, inter.subjectlen)) { return 8; }
+  if (leaf.sig_key != MTLS_KEY_ED25519 || leaf.sig_pad != MTLS_PAD_NONE || leaf.siglen != 64) { return 9; }
+  if (leaf.pub.kind != MTLS_KEY_ED25519 || leaf.pub.keylen != 32) { return 10; }
+  if (leaf.not_before != mtls_der_unix(2025, 1, 1, 0, 0, 0) || leaf.not_after != mtls_der_unix(2045, 1, 1, 0, 0, 0)) { return 11; }
+  // Extensions.
+  if (!root.has_bc || !root.is_ca || root.has_pathlen) { return 12; }
+  if (!inter.has_bc || !inter.is_ca || !inter.has_pathlen || inter.pathlen != 0) { return 13; }
+  if (!leaf.has_bc || leaf.is_ca) { return 14; }
+  if (!root.has_ku || root.ku != (MTLS_KU_KEY_CERT_SIGN | MTLS_KU_CRL_SIGN)) { return 15; }
+  if (!leaf.has_ku || leaf.ku != MTLS_KU_DIGITAL_SIGNATURE) { return 16; }
+  if (!leaf.has_eku || leaf.eku != (MTLS_EKU_SERVER | MTLS_EKU_CLIENT)) { return 17; }
+  if (root.has_eku) { return 18; }
+  if (leaf.skilen != 20 || leaf.akilen != 20 || inter.skilen != 20) { return 19; }
+  if (!mtls_bytes_eq(leaf.aki, leaf.akilen, inter.ski, inter.skilen)) { return 20; }
+  if (leaf.unknown_critical || leaf.has_nc) { return 21; }
+  // The SubjectPublicKeyInfo is the fixed Ed25519 prefix plus the key.
+  var spki: uint8[44];
+  if (leaf.spkilen != 44) { return 22; }
+  if (leaf.spki[0] != (uint8)0x30 || leaf.spki[1] != (uint8)0x2a || leaf.spki[11] != (uint8)0x00) { return 23; }
+  memcpy(&spki[0], leaf.spki, 12);
+  memcpy(&spki[12], leaf.pub.key, 32);
+  var want: uint8[32];
+  var got: uint8[32];
+  mtls_hash(MTLS_SHA256, &spki[0], 44, &want[0]);
+  mtls_cert_spki_sha256(&leaf, &got[0]);
+  if (memcmp(&want[0], &got[0], 32) != 0) { return 24; }
+  // Names.
+  var cn: string = mtls_cert_cn(&leaf);
+  if (cn != "example.test") { return 26; }
+  if (mtls_cert_cn(&root) != "mtls Test Root") { return 27; }
+  // Subject alternative names: 3 DNS, 2 IP.
+  var r: MtlsRd = mtls_rd(leaf.san, leaf.sanlen);
+  var kind: int32 = 0;
+  var p: uint8* = 0;
+  var n: int64 = 0;
+  var dns: int32 = 0;
+  var ips: int32 = 0;
+  while (mtls_cert_san_next(&r, &kind, &p, &n)) {
+    if (kind == MTLS_SAN_DNS) { dns = dns + 1; }
+    if (kind == MTLS_SAN_IP) { ips = ips + 1; }
+  }
+  if (dns != 3 || ips != 2 || r.bad || mtls_rd_left(&r) != 0) { return 28; }
+  // An owned copy outlives its buffer.
+  var owned: MtlsCert;
+  if (mtls_cert_parse_copy(&owned, &b3[0], mtls_t_pem_der(MTLS_T_LEAF_PEM, &b3[0], 4096)) != MTLS_OK) { return 29; }
+  memset(&b3[0], 0, 4096);
+  if (owned.pub.kind != MTLS_KEY_ED25519 || mtls_cert_cn(&owned) != "example.test") { return 30; }
+  mtls_cert_free(&owned);
+  if (owned.der != 0 || owned.owned != 0) { return 31; }
+  return 0;
+}
+
+fn t_variants() -> int32 {
+  var b: uint8[4096];
+  var c: MtlsCert;
+  // The v1 root: version 1, no extensions.
+  if (load(MTLS_T_ROOT_V1_PEM, &b[0], &c) != MTLS_OK) { return 1; }
+  if (c.version != 1 || c.has_bc || c.has_ku || !c.self_issued) { return 2; }
+  if (load(MTLS_T_LEAF_CRITEXT_PEM, &b[0], &c) != MTLS_OK || !c.unknown_critical) { return 3; }
+  if (load(MTLS_T_LEAF_NONCRITEXT_PEM, &b[0], &c) != MTLS_OK || c.unknown_critical) { return 4; }
+  if (load(MTLS_T_LEAF_CLIENTONLY_PEM, &b[0], &c) != MTLS_OK || c.eku != MTLS_EKU_CLIENT) { return 5; }
+  if (load(MTLS_T_LEAF_ANYEKU_PEM, &b[0], &c) != MTLS_OK || c.eku != MTLS_EKU_ANY) { return 6; }
+  if (load(MTLS_T_LEAF_NOEKU_PEM, &b[0], &c) != MTLS_OK || c.has_eku) { return 7; }
+  if (load(MTLS_T_NOKS_PEM, &b[0], &c) != MTLS_OK || !c.is_ca || c.ku != MTLS_KU_DIGITAL_SIGNATURE) { return 8; }
+  if (load(MTLS_T_NOTCA_PEM, &b[0], &c) != MTLS_OK || !c.has_bc || c.is_ca) { return 9; }
+  if (load(MTLS_T_P1_PEM, &b[0], &c) != MTLS_OK || c.pathlen != 1) { return 10; }
+  if (load(MTLS_T_CLIENTCA_PEM, &b[0], &c) != MTLS_OK || c.eku != MTLS_EKU_CLIENT) { return 11; }
+  // Name constraints.
+  if (load(MTLS_T_NCCA_PEM, &b[0], &c) != MTLS_OK) { return 12; }
+  if (!c.has_nc || !c.nc_critical || c.nc_other || c.nc_permlen == 0 || c.nc_excllen == 0) { return 13; }
+  if (load(MTLS_T_NCMAIL_PEM, &b[0], &c) != MTLS_OK || !c.has_nc || !c.nc_other) { return 14; }
+  // A self-signed end-entity certificate.
+  if (load(MTLS_T_SELFLEAF_PEM, &b[0], &c) != MTLS_OK || !c.self_issued || c.is_ca) { return 15; }
+  // Malformed ones.
+  if (load(MTLS_T_LEAF_DUPEXT_PEM, &b[0], &c) == MTLS_OK) { return 16; }
+  if (load(MTLS_T_LEAF_VER0_PEM, &b[0], &c) == MTLS_OK) { return 17; }
+  if (load(MTLS_T_LEAF_BCFALSE_PEM, &b[0], &c) == MTLS_OK) { return 18; }
+  if (load(MTLS_T_LEAF_TRAILING_PEM, &b[0], &c) == MTLS_OK) { return 19; }
+  // After a failed parse nothing half-filled is left behind.
+  if (c.tbs != 0 || c.pub.kind != MTLS_KEY_NONE) { return 20; }
+  // Not certificates at all.
+  var junk: uint8[4];
+  junk[0] = (uint8)0x30;
+  junk[1] = (uint8)0x00;
+  if (mtls_cert_parse(&c, &junk[0], 2) == MTLS_OK) { return 21; }
+  if (mtls_cert_parse(&c, &junk[0], 0) == MTLS_OK) { return 22; }
+  if (mtls_cert_parse(&c, 0, 0) == MTLS_OK) { return 23; }
+  return 0;
+}
+
+fn t_ec_rsa() -> int32 {
+  var b: uint8[4096];
+  var c: MtlsCert;
+  if (load(MTLS_T_EC256_LEAF_PEM, &b[0], &c) != MTLS_OK) { return 1; }
+  if (c.sig_key != MTLS_XKEY_EC || c.sig_hash != MTLS_SHA256 || c.pub.kind != MTLS_KEY_P256 || c.pub.keylen != 65 || c.pub.key[0] != (uint8)4) { return 2; }
+  if (load(MTLS_T_EC384_LEAF_PEM, &b[0], &c) != MTLS_OK) { return 3; }
+  if (c.sig_key != MTLS_XKEY_EC || c.sig_hash != MTLS_SHA384 || c.pub.kind != MTLS_KEY_P384 || c.pub.keylen != 97) { return 4; }
+  if (load(MTLS_T_EC256_ROOT_PEM, &b[0], &c) != MTLS_OK || !c.is_ca) { return 5; }
+  if (load(MTLS_T_RSA_LEAF_PEM, &b[0], &c) != MTLS_OK) { return 6; }
+  if (c.sig_key != MTLS_KEY_RSA || c.sig_pad != MTLS_PAD_PKCS1 || c.sig_hash != MTLS_SHA256) { return 7; }
+  if (c.pub.kind != MTLS_KEY_RSA || c.pub.keylen != 256 || c.pub.explen != 3 || c.pub.exp[0] != (uint8)1 || c.pub.exp[2] != (uint8)1) { return 8; }
+  if (c.pub.key[0] < (uint8)0x80 && c.pub.key[0] == (uint8)0) { return 9; }   // no leading zero byte
+  if (load(MTLS_T_RSA_LEAF_SHA384_PEM, &b[0], &c) != MTLS_OK || c.sig_hash != MTLS_SHA384 || c.sig_pad != MTLS_PAD_PKCS1) { return 10; }
+  if (load(MTLS_T_RSA_LEAF_SHA512_PEM, &b[0], &c) != MTLS_OK || c.sig_hash != MTLS_SHA512 || c.sig_pad != MTLS_PAD_PKCS1) { return 11; }
+  // RSASSA-PSS with MGF1 of the same hash and salt = hash length is supported.
+  if (load(MTLS_T_RSA_LEAF_PSS_PEM, &b[0], &c) != MTLS_OK) { return 12; }
+  if (c.sig_key != MTLS_KEY_RSA || c.sig_pad != MTLS_PAD_PSS || c.sig_hash != MTLS_SHA256) { return 13; }
+  // A salt of 20 bytes parses but is marked unusable.
+  if (load(MTLS_T_RSA_LEAF_PSS20_PEM, &b[0], &c) != MTLS_OK || c.sig_key != MTLS_KEY_NONE) { return 14; }
+  // A 1024 bit key parses (the verifier is the one that refuses it).
+  if (load(MTLS_T_RSA1024_ROOT_PEM, &b[0], &c) != MTLS_OK || c.pub.kind != MTLS_KEY_RSA || c.pub.keylen != 128) { return 15; }
+  return 0;
+}
+
+fn dns_ok(pat: string, host: string) -> bool {
+  return mtls_host_match_dns(pat.chars, (int64)pat.length, host);
+}
+
+fn ip_len(host: string) -> int32 {
+  var out: uint8[16];
+  return mtls_host_ip(host, &out[0]);
+}
+
+fn t_hostnames() -> int32 {
+  // Patterns against hosts.
+  if (!dns_ok("example.com", "example.com")) { return 1; }
+  if (!dns_ok("Example.COM", "eXample.com")) { return 2; }
+  if (!dns_ok("example.com", "example.com.")) { return 3; }
+  if (dns_ok("example.com", "www.example.com")) { return 4; }
+  if (dns_ok("example.com.", "example.com")) { return 5; }
+  if (!dns_ok("*.example.com", "foo.example.com")) { return 6; }
+  if (!dns_ok("*.example.com", "FOO.Example.COM")) { return 7; }
+  if (dns_ok("*.example.com", "example.com")) { return 8; }
+  if (dns_ok("*.example.com", "a.b.example.com")) { return 9; }
+  if (dns_ok("*.example.com", ".example.com")) { return 10; }
+  if (dns_ok("*.com", "example.com")) { return 11; }
+  if (dns_ok("*", "localhost")) { return 12; }
+  if (dns_ok("f*.example.com", "foo.example.com")) { return 13; }
+  if (dns_ok("*o.example.com", "foo.example.com")) { return 14; }
+  if (dns_ok("foo.*.example.com", "foo.bar.example.com")) { return 15; }
+  if (dns_ok("*.*.example.com", "a.b.example.com")) { return 16; }
+  if (dns_ok("*.example.com", "*.example.com")) { return 17; }
+  if (dns_ok("example.com", "")) { return 18; }
+  if (dns_ok("example.com", "exa mple.com")) { return 19; }
+  if (dns_ok("a..b", "a..b")) { return 20; }
+  if (dns_ok("*.example.com", "foo.example.com.evil.com")) { return 21; }
+  if (dns_ok("*.example.com", "xexample.com")) { return 22; }
+  if (!dns_ok("*.example.co.uk", "a.example.co.uk")) { return 23; }
+  if (!dns_ok("a-b_c.example.com", "A-B_C.example.com")) { return 24; }
+  // IP literals.
+  var o: uint8[16];
+  if (ip_len("1.2.3.4") != 4) { return 25; }
+  if (ip_len("01.2.3.4") != 0 || ip_len("1.2.3") != 0 || ip_len("1.2.3.4.5") != 0 || ip_len("256.1.1.1") != 0 || ip_len("1..3.4") != 0) { return 26; }
+  if (ip_len("example.com") != 0 || ip_len("") != 0 || ip_len("1.2.3.4a") != 0) { return 27; }
+  if (ip_len("::1") != 16 || ip_len("::") != 16 || ip_len("1::") != 16 || ip_len("1:2:3:4:5:6:7:8") != 16) { return 28; }
+  if (ip_len("1:2:3:4:5:6:7::") != 16 || ip_len("[::1]") != 16 || ip_len("2001:db8::1") != 16) { return 29; }
+  if (ip_len("1:2:3:4:5:6:7:8:9") != 0 || ip_len("1::2::3") != 0 || ip_len(":1") != 0 || ip_len("1:") != 0) { return 30; }
+  if (ip_len("g::1") != 0 || ip_len("12345::1") != 0 || ip_len("[1.2.3.4]") != 0 || ip_len("1:2:3:4:5:6:7:8::") != 0) { return 31; }
+  if (ip_len("::ffff:1.2.3.4") != 16) { return 32; }
+  mtls_host_ip("::ffff:1.2.3.4", &o[0]);
+  if (o[10] != (uint8)255 || o[11] != (uint8)255 || o[12] != (uint8)1 || o[15] != (uint8)4 || o[0] != (uint8)0) { return 33; }
+  mtls_host_ip("2001:db8::1", &o[0]);
+  if (o[0] != (uint8)0x20 || o[1] != (uint8)0x01 || o[2] != (uint8)0x0d || o[3] != (uint8)0xb8 || o[15] != (uint8)1 || o[8] != (uint8)0) { return 34; }
+  mtls_host_ip("1:2:3:4:5:6:7::", &o[0]);
+  if (o[13] != (uint8)7 || o[14] != (uint8)0 || o[15] != (uint8)0) { return 35; }
+  return 0;
+}
+
+fn host_ok(c: MtlsCert*, host: string) -> bool {
+  return mtls_cert_match_host(c, host);
+}
+
+fn t_cert_hosts() -> int32 {
+  var b: uint8[4096];
+  var c: MtlsCert;
+  if (load(MTLS_T_LEAF_PEM, &b[0], &c) != MTLS_OK) { return 1; }
+  // SAN is example.test, *.wild.test, Mixed.Case.Test, 192.0.2.1, 2001:db8::1.
+  if (!host_ok(&c, "example.test")) { return 2; }
+  if (!host_ok(&c, "EXAMPLE.TEST")) { return 3; }
+  if (!host_ok(&c, "example.test.")) { return 4; }
+  if (host_ok(&c, "www.example.test")) { return 5; }
+  if (!host_ok(&c, "a.wild.test")) { return 6; }
+  if (host_ok(&c, "wild.test") || host_ok(&c, "a.b.wild.test")) { return 7; }
+  if (!host_ok(&c, "mixed.case.test")) { return 8; }
+  if (!host_ok(&c, "192.0.2.1") || host_ok(&c, "192.0.2.2")) { return 9; }
+  if (!host_ok(&c, "2001:db8::1") || !host_ok(&c, "[2001:db8::1]") || !host_ok(&c, "2001:0db8:0:0:0:0:0:1")) { return 10; }
+  if (host_ok(&c, "2001:db8::2") || host_ok(&c, "::1")) { return 11; }
+  if (host_ok(&c, "")) { return 12; }
+  // The subject CN (example.test) is not a SAN: a cert with no SAN matches nothing.
+  if (load(MTLS_T_ROOT_PEM, &b[0], &c) != MTLS_OK) { return 13; }
+  if (host_ok(&c, "mtls Test Root") || host_ok(&c, "root.test")) { return 14; }
+  if (load(MTLS_T_SELFLEAF_PEM, &b[0], &c) != MTLS_OK || !host_ok(&c, "self.test") || host_ok(&c, "1.2.3.4")) { return 15; }
+  return 0;
+}
+
+fn in_sub(name: string, cons: string) -> bool {
+  return mtls_dns_in_subtree(name.chars, (int64)name.length, cons.chars, (int64)cons.length);
+}
+
+fn t_dns_subtree() -> int32 {
+  if (!in_sub("example.com", "example.com")) { return 1; }
+  if (!in_sub("a.example.com", "example.com")) { return 2; }
+  if (!in_sub("A.B.Example.COM", "example.com")) { return 3; }
+  if (in_sub("badexample.com", "example.com")) { return 4; }
+  if (in_sub("example.org", "example.com")) { return 5; }
+  if (in_sub("com", "example.com")) { return 6; }
+  if (in_sub("example.com", ".example.com")) { return 7; }
+  if (!in_sub("a.example.com", ".example.com")) { return 8; }
+  if (!in_sub("anything.test", "")) { return 9; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = t_system_bundle();
+  if (rc != 0) { println("system bundle: {rc}"); return 32 + rc; }
+  rc = t_ed25519();
+  if (rc != 0) { println("ed25519 fixtures: {rc}"); return 64 + rc; }
+  rc = t_variants();
+  if (rc != 0) { println("variants: {rc}"); return 96 + rc; }
+  rc = t_ec_rsa();
+  if (rc != 0) { println("ec and rsa: {rc}"); return 128 + rc; }
+  rc = t_hostnames();
+  if (rc != 0) { println("host names: {rc}"); return 160 + rc; }
+  rc = t_cert_hosts();
+  if (rc != 0) { println("cert host names: {rc}"); return 192 + rc; }
+  rc = t_dns_subtree();
+  if (rc != 0) { println("dns subtree: {rc}"); return 224 + rc; }
+  println("x509 cert: ok");
+  return 0;
+}

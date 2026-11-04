@@ -1,0 +1,190 @@
+// Private key loading: Ed25519, EC and RSA, as PEM and DER, in the PKCS#8,
+// SEC1 and PKCS#1 shapes, checked against the public keys in the matching
+// certificates.
+
+import "std/io";
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/sig";
+import "mtls/x509/x509";
+import "data/x509/fixtures";
+
+fn load_cert(pem: string, buf: uint8*, c: MtlsCert*) -> bool {
+  var n: int64 = mtls_t_pem_der(pem, buf, 4096);
+  return n > 0 && mtls_cert_parse(c, buf, n) == MTLS_OK;
+}
+
+fn load_key(text: string, k: MtlsPrivKey*) -> int32 {
+  return mtls_key_load(text.chars, (int64)text.length, k);
+}
+
+fn t_ed25519() -> int32 {
+  var b: uint8[4096];
+  var c: MtlsCert;
+  if (!load_cert(MTLS_T_LEAF_PEM, &b[0], &c)) { return 1; }
+  var k: MtlsPrivKey;
+  if (load_key(MTLS_T_LEAF_KEY, &k) != MTLS_OK) { return 2; }
+  if (k.kind != MTLS_KEY_ED25519 || k.publen != 32) { return 3; }
+  if (memcmp(&k.pub[0], c.pub.key, 32) != 0 || memcmp(&k.sk[32], c.pub.key, 32) != 0) { return 4; }
+  // The seed is the last 32 bytes of the PKCS#8 DER.
+  var der: string = MTLS_T_LEAF_P8_DER;
+  if (der.length != (uint64)48 || memcmp(&k.sk[0], der.chars + 16, 32) != 0) { return 5; }
+  // Sign with it and verify with the certificate's key.
+  var msg: string = "the quick brown fox";
+  var sig: uint8[64];
+  var sl: int64 = 0;
+  if (mtls_sign(&k, MTLS_SIG_ED25519, msg.chars, (int64)msg.length, &sig[0], 64, &sl) != MTLS_OK || sl != 64) { return 6; }
+  if (mtls_verify_scheme(MTLS_SIG_ED25519, &c.pub, msg.chars, (int64)msg.length, &sig[0], 64) != MTLS_OK) { return 7; }
+  if (mtls_verify_scheme(MTLS_SIG_ED25519, &c.pub, msg.chars, (int64)msg.length - 1, &sig[0], 64) == MTLS_OK) { return 8; }
+  mtls_privkey_free(&k);
+  if (k.kind != MTLS_KEY_NONE || k.sk[0] != (uint8)0) { return 9; }
+  // Raw DER, through the auto-detecting and the explicit entry points.
+  var k2: MtlsPrivKey;
+  if (mtls_key_load_der(der.chars, 48, &k2) != MTLS_OK || k2.kind != MTLS_KEY_ED25519) { return 10; }
+  if (memcmp(&k2.pub[0], c.pub.key, 32) != 0) { return 11; }
+  mtls_privkey_free(&k2);
+  if (mtls_key_load(der.chars, 48, &k2) != MTLS_OK || k2.kind != MTLS_KEY_ED25519) { return 12; }
+  mtls_privkey_free(&k2);
+  // A bundle with the certificate first and the key after it.
+  var bundle: string = MTLS_T_LEAF_BUNDLE_PEM;
+  if (mtls_key_load_pem(bundle.chars, (int64)bundle.length, &k2) != MTLS_OK || k2.kind != MTLS_KEY_ED25519) { return 13; }
+  mtls_privkey_free(&k2);
+  // A certificate alone holds no key.
+  var certonly: string = MTLS_T_LEAF_PEM;
+  if (mtls_key_load_pem(certonly.chars, (int64)certonly.length, &k2) != MTLS_E_DECODE) { return 14; }
+  if (mtls_key_load(certonly.chars, (int64)certonly.length, &k2) != MTLS_E_DECODE) { return 15; }
+  // Encrypted keys are recognised, not loaded.
+  if (load_key(MTLS_T_LEAF_ENCRYPTED_KEY, &k2) != MTLS_E_UNSUPPORTED) { return 16; }
+  if (k2.kind != MTLS_KEY_NONE) { return 17; }
+  return 0;
+}
+
+// An EC key: the scalar, and the public point compared with the certificate.
+fn ec_check(pem_cert: string, key_text: string, kind: int32, flen: int64) -> int32 {
+  var b: uint8[4096];
+  var c: MtlsCert;
+  if (!load_cert(pem_cert, &b[0], &c)) { return 1; }
+  var k: MtlsPrivKey;
+  if (load_key(key_text, &k) != MTLS_OK) { return 2; }
+  if (k.kind != kind) { return 3; }
+  if (k.publen != c.pub.keylen || memcmp(&k.pub[0], c.pub.key, c.pub.keylen) != 0) { return 4; }
+  // Not all zero, and nothing beyond the scalar.
+  var any: bool = false;
+  for i in 0..flen {
+    if (k.sk[i] != (uint8)0) { any = true; }
+  }
+  for i in flen..64 {
+    if (k.sk[i] != (uint8)0) { return 5; }
+  }
+  if (!any) { return 6; }
+  var first: uint8[64];
+  memcpy(&first[0], &k.sk[0], 64);
+  mtls_privkey_free(&k);
+  // Every other spelling of the same key gives the same scalar.
+  return 0;
+}
+
+fn same_scalar(a: string, b: string, kind: int32) -> bool {
+  var k1: MtlsPrivKey;
+  var k2: MtlsPrivKey;
+  if (load_key(a, &k1) != MTLS_OK || load_key(b, &k2) != MTLS_OK) { return false; }
+  var ok: bool = k1.kind == kind && k2.kind == kind && memcmp(&k1.sk[0], &k2.sk[0], 64) == 0 && k1.publen == k2.publen && memcmp(&k1.pub[0], &k2.pub[0], 97) == 0;
+  mtls_privkey_free(&k1);
+  mtls_privkey_free(&k2);
+  return ok;
+}
+
+fn t_ec() -> int32 {
+  var rc: int32 = ec_check(MTLS_T_EC256_LEAF_PEM, MTLS_T_EC256_LEAF_KEY, MTLS_KEY_P256, 32);
+  if (rc != 0) { return rc; }
+  rc = ec_check(MTLS_T_EC256_LEAF_PEM, MTLS_T_EC256_LEAF_SEC1_KEY, MTLS_KEY_P256, 32);
+  if (rc != 0) { return 10 + rc; }
+  rc = ec_check(MTLS_T_EC384_LEAF_PEM, MTLS_T_EC384_LEAF_KEY, MTLS_KEY_P384, 48);
+  if (rc != 0) { return 20 + rc; }
+  rc = ec_check(MTLS_T_EC384_LEAF_PEM, MTLS_T_EC384_LEAF_SEC1_KEY, MTLS_KEY_P384, 48);
+  if (rc != 0) { return 30 + rc; }
+  if (!same_scalar(MTLS_T_EC256_LEAF_KEY, MTLS_T_EC256_LEAF_SEC1_KEY, MTLS_KEY_P256)) { return 41; }
+  if (!same_scalar(MTLS_T_EC256_LEAF_KEY, MTLS_T_EC256_LEAF_P8_DER, MTLS_KEY_P256)) { return 42; }
+  if (!same_scalar(MTLS_T_EC384_LEAF_KEY, MTLS_T_EC384_LEAF_P8_DER, MTLS_KEY_P384)) { return 43; }
+  // The key file is not the CA's.
+  var k: MtlsPrivKey;
+  if (load_key(MTLS_T_EC256_ROOT_KEY, &k) != MTLS_OK || k.kind != MTLS_KEY_P256) { return 44; }
+  var b: uint8[4096];
+  var c: MtlsCert;
+  if (!load_cert(MTLS_T_EC256_LEAF_PEM, &b[0], &c)) { return 45; }
+  if (memcmp(&k.pub[0], c.pub.key, 65) == 0) { return 46; }
+  mtls_privkey_free(&k);
+  return 0;
+}
+
+fn rsa_check(key_text: string) -> int32 {
+  var b: uint8[4096];
+  var c: MtlsCert;
+  if (!load_cert(MTLS_T_RSA_LEAF_PEM, &b[0], &c)) { return 1; }
+  var k: MtlsPrivKey;
+  if (load_key(key_text, &k) != MTLS_OK) { return 2; }
+  if (k.kind != MTLS_KEY_RSA || k.der == 0 || k.derlen < 1000) { return 3; }
+  // Modulus and exponent are the certificate's, without a leading zero byte.
+  if (!mtls_bytes_eq(k.n, k.nlen, c.pub.key, c.pub.keylen) || !mtls_bytes_eq(k.e, k.elen, c.pub.exp, c.pub.explen)) { return 4; }
+  if (k.nlen != 256 || k.n[0] == (uint8)0 || k.dlen < 200 || k.plen != 128 || k.qlen != 128) { return 5; }
+  if (k.dplen < 100 || k.dqlen < 100 || k.qinvlen < 100) { return 6; }
+  // All the parts live inside the owned copy.
+  var lo: int64 = (int64)k.der;
+  var hi: int64 = lo + k.derlen;
+  if ((int64)k.n < lo || (int64)k.n + k.nlen > hi) { return 7; }
+  if ((int64)k.qinv < lo || (int64)k.qinv + k.qinvlen > hi) { return 8; }
+  mtls_privkey_free(&k);
+  if (k.der != 0 || k.n != 0 || k.kind != MTLS_KEY_NONE) { return 9; }
+  return 0;
+}
+
+fn t_rsa() -> int32 {
+  var rc: int32 = rsa_check(MTLS_T_RSA_LEAF_KEY);
+  if (rc != 0) { return rc; }
+  rc = rsa_check(MTLS_T_RSA_LEAF_PKCS1_KEY);
+  if (rc != 0) { return 10 + rc; }
+  rc = rsa_check(MTLS_T_RSA_LEAF_P8_DER);
+  if (rc != 0) { return 20 + rc; }
+  rc = rsa_check(MTLS_T_RSA_LEAF_PKCS1_DER);
+  if (rc != 0) { return 30 + rc; }
+  return 0;
+}
+
+fn t_bad() -> int32 {
+  var k: MtlsPrivKey;
+  var junk: uint8[8];
+  for i in 0..8 { junk[i] = (uint8)i; }
+  if (mtls_key_load(&junk[0], 8, &k) == MTLS_OK) { return 1; }
+  if (mtls_key_load(&junk[0], 0, &k) == MTLS_OK) { return 2; }
+  if (mtls_key_load(0, 0, &k) == MTLS_OK) { return 3; }
+  if (mtls_key_load_der(&junk[0], 8, &k) == MTLS_OK) { return 4; }
+  var empty: string = "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n";
+  if (load_key(empty, &k) == MTLS_OK) { return 5; }
+  var nokey: string = "-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----\n";
+  if (load_key(nokey, &k) == MTLS_OK) { return 6; }
+  // A truncated PKCS#8 file.
+  var der: string = MTLS_T_LEAF_P8_DER;
+  for n in 0..48 {
+    if (mtls_key_load_der(der.chars, (int64)n, &k) == MTLS_OK) { return 7; }
+  }
+  // Trailing bytes after a DER key.
+  var padded: uint8[64];
+  memcpy(&padded[0], der.chars, 48);
+  padded[48] = (uint8)0;
+  if (mtls_key_load_der(&padded[0], 49, &k) == MTLS_OK) { return 8; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = t_ed25519();
+  if (rc != 0) { println("ed25519 keys: {rc}"); return 32 + rc; }
+  rc = t_ec();
+  if (rc != 0) { println("ec keys: {rc}"); return 64 + rc; }
+  rc = t_rsa();
+  if (rc != 0) { println("rsa keys: {rc}"); return 128 + rc; }
+  rc = t_bad();
+  if (rc != 0) { println("bad keys: {rc}"); return 192 + rc; }
+  println("x509 key: ok");
+  return 0;
+}

@@ -1,0 +1,368 @@
+// DER reader, time conversion and PEM decoding: the accepted forms and,
+// above all, the rejected ones.
+
+import "std/io";
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/x509/der";
+import "mtls/x509/pem";
+
+fn hexval(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  return 0;
+}
+
+fn unhex(s: string, out: uint8*) -> int64 {
+  var n: int64 = (int64)s.length / 2;
+  for i in 0..n {
+    out[i] = (uint8)(hexval((int32)s[i * 2]) * 16 + hexval((int32)s[i * 2 + 1]));
+  }
+  return n;
+}
+
+// Reads one element of tag `tag` from the hex and says whether the reader
+// stayed good and consumed everything.
+fn seq_ok(hex: string) -> bool {
+  var b: uint8[512];
+  var n: int64 = unhex(hex, &b[0]);
+  var r: MtlsRd = mtls_rd(&b[0], n);
+  var body: MtlsRd;
+  if (!mtls_der_seq(&r, &body)) { return false; }
+  return mtls_rd_ok_end(&r);
+}
+
+fn int_small(hex: string, want: int64) -> bool {
+  var b: uint8[64];
+  var n: int64 = unhex(hex, &b[0]);
+  var r: MtlsRd = mtls_rd(&b[0], n);
+  var v: int64 = -1;
+  if (!mtls_der_small(&r, &v)) { return false; }
+  return mtls_rd_ok_end(&r) && v == want;
+}
+
+fn int_rejected(hex: string) -> bool {
+  var b: uint8[64];
+  var n: int64 = unhex(hex, &b[0]);
+  var r: MtlsRd = mtls_rd(&b[0], n);
+  var p: uint8* = 0;
+  var k: int64 = 0;
+  if (mtls_der_int(&r, &p, &k)) { return false; }
+  return r.bad;
+}
+
+// A time element built from its text, so the cases read as dates.
+fn tt(tag: int32, text: string, out: uint8*) -> int64 {
+  out[0] = (uint8)tag;
+  out[1] = (uint8)text.length;
+  for i in 0..(int64)text.length { out[2 + i] = text.chars[i]; }
+  return (int64)text.length + 2;
+}
+
+fn time_is(tag: int32, text: string, want: int64) -> bool {
+  var b: uint8[64];
+  var n: int64 = tt(tag, text, &b[0]);
+  var r: MtlsRd = mtls_rd(&b[0], n);
+  var t: int64 = 0;
+  if (!mtls_der_time(&r, &t)) { return false; }
+  return mtls_rd_ok_end(&r) && t == want;
+}
+
+fn time_rejected(tag: int32, text: string) -> bool {
+  var b: uint8[64];
+  var n: int64 = tt(tag, text, &b[0]);
+  var r: MtlsRd = mtls_rd(&b[0], n);
+  var t: int64 = 0;
+  if (mtls_der_time(&r, &t)) { return false; }
+  return r.bad;
+}
+
+fn t_lengths() -> int32 {
+  if (!seq_ok("3003020105")) { return 1; }
+  if (!seq_ok("3000")) { return 2; }
+  // Non-minimal length forms.
+  if (seq_ok("308103020105")) { return 3; }
+  if (seq_ok("30820003020105")) { return 4; }
+  // Indefinite length.
+  if (seq_ok("30800201050000")) { return 6; }
+  // Truncated: header, length, body.
+  if (seq_ok("30")) { return 7; }
+  if (seq_ok("3005020105")) { return 8; }
+  if (seq_ok("308201")) { return 9; }
+  // High tag numbers are not used by X.509.
+  if (seq_ok("1f0100")) { return 10; }
+  // A length that does not fit in four bytes, and a huge one that does.
+  if (seq_ok("308501000000000000")) { return 11; }
+  if (seq_ok("3084ffffffff0201")) { return 12; }
+  // A valid long form: 200 bytes of content.
+  var b: uint8[256];
+  memset(&b[0], 0, 256);
+  b[0] = (uint8)0x30;
+  b[1] = (uint8)0x81;
+  b[2] = (uint8)200;
+  b[3] = (uint8)0x04;
+  b[4] = (uint8)0x81;
+  b[5] = (uint8)197;
+  var r: MtlsRd = mtls_rd(&b[0], 203);
+  var body: MtlsRd;
+  if (!mtls_der_seq(&r, &body) || !mtls_rd_ok_end(&r) || body.n != 200) { return 13; }
+  // Trailing bytes are visible to the caller.
+  var t: uint8[8];
+  var n: int64 = unhex("30030201050000", &t[0]);
+  var r2: MtlsRd = mtls_rd(&t[0], n);
+  var b2: MtlsRd;
+  if (!mtls_der_seq(&r2, &b2) || mtls_rd_ok_end(&r2)) { return 14; }
+  // Wrong tag marks the reader bad.
+  n = unhex("3100", &t[0]);
+  var r3: MtlsRd = mtls_rd(&t[0], n);
+  if (mtls_der_seq(&r3, &b2) || !r3.bad) { return 15; }
+  // Optional elements: absent ones leave the reader good and untouched.
+  n = unhex("0201050101ff", &t[0]);
+  var r4: MtlsRd = mtls_rd(&t[0], n);
+  if (mtls_der_opt(&r4, 0xa0, &b2) || r4.bad || r4.pos != 0) { return 16; }
+  if (mtls_der_peek(&r4) != 2) { return 17; }
+  var bl: bool = false;
+  var v: int64 = 0;
+  if (!mtls_der_small(&r4, &v) || !mtls_der_bool(&r4, &bl) || !bl || !mtls_rd_ok_end(&r4)) { return 18; }
+  if (mtls_der_peek(&r4) != -1) { return 19; }
+  // Explicit context tags.
+  n = unhex("a003020105", &t[0]);
+  var r5: MtlsRd = mtls_rd(&t[0], n);
+  if (!mtls_der_opt(&r5, mtls_der_ctx(0), &b2)) { return 20; }
+  if (!mtls_der_small(&b2, &v) || v != 5 || !mtls_rd_ok_end(&b2)) { return 21; }
+  return 0;
+}
+
+fn t_integers() -> int32 {
+  if (!int_small("020100", 0)) { return 1; }
+  if (!int_small("020105", 5)) { return 2; }
+  if (!int_small("02020080", 128)) { return 3; }
+  if (!int_small("02047fffffff", 2147483647)) { return 4; }
+  if (!int_small("02050100000000", 4294967296)) { return 5; }
+  if (!int_rejected("0200")) { return 6; }
+  if (!int_rejected("02020001")) { return 7; }
+  if (!int_rejected("0202ff80")) { return 8; }
+  if (!int_rejected("0300")) { return 9; }
+  // Negative numbers are valid INTEGERs but not valid unsigned ones.
+  var b: uint8[16];
+  var n: int64 = unhex("020180", &b[0]);
+  var r: MtlsRd = mtls_rd(&b[0], n);
+  var p: uint8* = 0;
+  var k: int64 = 0;
+  if (!mtls_der_int(&r, &p, &k) || k != 1) { return 10; }
+  var r2: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_uint(&r2, &p, &k) || !r2.bad) { return 11; }
+  // uint strips the sign byte and the value 0 is empty.
+  n = unhex("02020080", &b[0]);
+  var r3: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_uint(&r3, &p, &k) || k != 1 || p[0] != (uint8)0x80) { return 12; }
+  n = unhex("020100", &b[0]);
+  var r4: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_uint(&r4, &p, &k) || k != 0) { return 13; }
+  // Too big for mtls_der_small.
+  n = unhex("0209010000000000000000", &b[0]);
+  var r5: MtlsRd = mtls_rd(&b[0], n);
+  var v: int64 = 0;
+  if (mtls_der_small(&r5, &v) || !r5.bad) { return 14; }
+  return 0;
+}
+
+fn t_simple_types() -> int32 {
+  var b: uint8[32];
+  var n: int64 = 0;
+  var bl: bool = false;
+  // BOOLEAN
+  n = unhex("0101ff", &b[0]);
+  var r1: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_bool(&r1, &bl) || !bl) { return 1; }
+  n = unhex("010100", &b[0]);
+  var r2: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_bool(&r2, &bl) || bl) { return 2; }
+  n = unhex("010101", &b[0]);
+  var r3: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_bool(&r3, &bl) || !r3.bad) { return 3; }
+  n = unhex("0102ffff", &b[0]);
+  var r4: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_bool(&r4, &bl)) { return 4; }
+  // NULL
+  n = unhex("0500", &b[0]);
+  var r5: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_null(&r5)) { return 5; }
+  n = unhex("050100", &b[0]);
+  var r6: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_null(&r6)) { return 6; }
+  // OID
+  var p: uint8* = 0;
+  var k: int64 = 0;
+  n = unhex("06032a0304", &b[0]);
+  var r7: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_oid(&r7, &p, &k) || k != 3) { return 7; }
+  if (!mtls_der_oid_is(p, k, "2a0304") || mtls_der_oid_is(p, k, "2a0305") || mtls_der_oid_is(p, k, "2a03")) { return 8; }
+  n = unhex("06032a8004", &b[0]);
+  var r8: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_oid(&r8, &p, &k)) { return 9; }
+  n = unhex("06022a83", &b[0]);
+  var r9: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_oid(&r9, &p, &k)) { return 10; }
+  n = unhex("0600", &b[0]);
+  var r10: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_oid(&r10, &p, &k)) { return 11; }
+  // BIT STRING
+  var u: int32 = 0;
+  n = unhex("030204f0", &b[0]);
+  var r11: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_bits(&r11, &p, &k, &u) || k != 1 || u != 4) { return 12; }
+  n = unhex("030204f1", &b[0]);
+  var r12: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_bits(&r12, &p, &k, &u)) { return 13; }
+  n = unhex("030107", &b[0]);
+  var r13: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_bits(&r13, &p, &k, &u)) { return 14; }
+  n = unhex("030108", &b[0]);
+  var r14: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_bits(&r14, &p, &k, &u)) { return 15; }
+  n = unhex("030100", &b[0]);
+  var r15: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_bits_bytes(&r15, &p, &k) || k != 0) { return 16; }
+  n = unhex("030204f0", &b[0]);
+  var r16: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_bits_bytes(&r16, &p, &k)) { return 17; }
+  // OCTET STRING
+  n = unhex("0403010203", &b[0]);
+  var r17: MtlsRd = mtls_rd(&b[0], n);
+  if (!mtls_der_octets(&r17, &p, &k) || k != 3 || p[2] != (uint8)3) { return 18; }
+  n = unhex("0303010203", &b[0]);
+  var r18: MtlsRd = mtls_rd(&b[0], n);
+  if (mtls_der_octets(&r18, &p, &k)) { return 19; }
+  return 0;
+}
+
+fn t_time() -> int32 {
+  // 2025-01-01 00:00:00 UTC
+  if (mtls_der_unix(2025, 1, 1, 0, 0, 0) != 1735689600) { return 1; }
+  if (mtls_der_unix(1970, 1, 1, 0, 0, 0) != 0) { return 2; }
+  if (mtls_der_unix(2000, 2, 29, 12, 0, 0) != 951825600) { return 3; }
+  if (mtls_der_unix(1950, 1, 1, 0, 0, 0) != -631152000) { return 4; }
+  var utc: int32 = 0x17;
+  var gen: int32 = 0x18;
+  if (!time_is(utc, "250101000000Z", 1735689600)) { return 5; }
+  // The pivot year: 49 is 2049, 50 is 1950.
+  if (!time_is(utc, "490101000000Z", mtls_der_unix(2049, 1, 1, 0, 0, 0))) { return 6; }
+  if (!time_is(utc, "500101000000Z", -631152000)) { return 7; }
+  if (!time_is(gen, "20500101000000Z", mtls_der_unix(2050, 1, 1, 0, 0, 0))) { return 8; }
+  if (!time_is(gen, "99991231235959Z", mtls_der_unix(9999, 12, 31, 23, 59, 59))) { return 9; }
+  // Leap day: 2024 has one, 2023 does not; 2100 does not, 2000 does.
+  if (!time_is(utc, "240229120000Z", mtls_der_unix(2024, 2, 29, 12, 0, 0))) { return 10; }
+  if (!time_rejected(utc, "230229120000Z")) { return 11; }
+  if (!time_rejected(gen, "21000229120000Z")) { return 12; }
+  if (!time_is(gen, "20000229120000Z", 951825600)) { return 13; }
+  // Only the Z form with seconds.
+  if (!time_rejected(utc, "2501010000Z")) { return 14; }
+  if (!time_rejected(utc, "2501010000000")) { return 15; }
+  if (!time_rejected(utc, "250101000000+0100")) { return 16; }
+  if (!time_rejected(utc, "250101000000z")) { return 17; }
+  if (!time_rejected(utc, "250101000000.5Z")) { return 18; }
+  if (!time_rejected(gen, "20250101000000.5Z")) { return 19; }
+  if (!time_rejected(gen, "250101000000Z")) { return 20; }
+  if (!time_rejected(utc, "20250101000000Z")) { return 21; }
+  // Field ranges.
+  if (!time_rejected(utc, "251301000000Z")) { return 22; }
+  if (!time_rejected(utc, "250001000000Z")) { return 23; }
+  if (!time_rejected(utc, "250230000000Z")) { return 24; }
+  if (!time_rejected(utc, "250100000000Z")) { return 25; }
+  if (!time_rejected(utc, "250101240000Z")) { return 26; }
+  if (!time_rejected(utc, "250101006000Z")) { return 27; }
+  if (!time_rejected(utc, "250101000060Z")) { return 28; }
+  if (!time_rejected(utc, "25010a000000Z")) { return 29; }
+  if (!time_rejected(0x02, "250101000000Z")) { return 30; }
+  if (!time_rejected(utc, "")) { return 31; }
+  return 0;
+}
+
+fn b64(s: string, out: uint8*, cap: int64, olen: int64*) -> int32 {
+  return mtls_pem_b64(s.chars, (int64)s.length, out, cap, olen);
+}
+
+fn t_base64() -> int32 {
+  var o: uint8[64];
+  var n: int64 = 0;
+  if (b64("AQID", &o[0], 64, &n) != MTLS_OK || n != 3 || o[0] != (uint8)1 || o[2] != (uint8)3) { return 1; }
+  if (b64("AQI=", &o[0], 64, &n) != MTLS_OK || n != 2 || o[1] != (uint8)2) { return 2; }
+  if (b64("AQ==", &o[0], 64, &n) != MTLS_OK || n != 1 || o[0] != (uint8)1) { return 3; }
+  if (b64("", &o[0], 64, &n) != MTLS_OK || n != 0) { return 4; }
+  // Whitespace and line breaks anywhere.
+  if (b64("AQ\r\nID\n", &o[0], 64, &n) != MTLS_OK || n != 3) { return 5; }
+  if (b64(" A Q I D\t", &o[0], 64, &n) != MTLS_OK || n != 3) { return 6; }
+  // Rejected: bad padding, data after padding, wrong length, bad alphabet.
+  if (b64("AQ=", &o[0], 64, &n) == MTLS_OK) { return 7; }
+  if (b64("AQ==AQ==", &o[0], 64, &n) == MTLS_OK) { return 8; }
+  if (b64("A===", &o[0], 64, &n) == MTLS_OK) { return 9; }
+  if (b64("AQI", &o[0], 64, &n) == MTLS_OK) { return 10; }
+  if (b64("AQ$=", &o[0], 64, &n) == MTLS_OK) { return 11; }
+  if (b64("AQ-_", &o[0], 64, &n) == MTLS_OK) { return 12; }
+  if (b64("AQ=I", &o[0], 64, &n) == MTLS_OK) { return 13; }
+  // Padding bits must be zero: "AR==" would carry a stray bit.
+  if (b64("AR==", &o[0], 64, &n) == MTLS_OK) { return 14; }
+  if (b64("AQJ=", &o[0], 64, &n) == MTLS_OK) { return 15; }
+  // Not enough room.
+  if (b64("AQIDBAUG", &o[0], 4, &n) != MTLS_E_SPACE) { return 16; }
+  // PEM headers (encrypted keys) are called out.
+  if (b64("Proc-Type: 4,ENCRYPTED", &o[0], 64, &n) != MTLS_E_UNSUPPORTED) { return 17; }
+  return 0;
+}
+
+fn t_pem_blocks() -> int32 {
+  var txt: string = "# a bundle\nsome text\n-----BEGIN CERTIFICATE-----\r\nAQID\r\n-----END CERTIFICATE-----\r\nmore text\n-----BEGIN PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n";
+  var it: MtlsPemIter;
+  var blk: MtlsPemBlock;
+  mtls_pem_iter(&it, txt.chars, (int64)txt.length);
+  if (mtls_pem_next(&it, &blk) != 1 || blk.label != "CERTIFICATE") { return 1; }
+  var o: uint8[16];
+  var n: int64 = 0;
+  if (mtls_pem_decode(&blk, &o[0], 16, &n) != MTLS_OK || n != 3 || o[1] != (uint8)2) { return 2; }
+  if (mtls_pem_next(&it, &blk) != 1 || blk.label != "PRIVATE KEY") { return 3; }
+  var der: uint8* = 0;
+  if (mtls_pem_decode_alloc(&blk, &der, &n) != MTLS_OK || n != 3 || der[0] != (uint8)4) { return 4; }
+  free(der);
+  if (mtls_pem_next(&it, &blk) != 0) { return 5; }
+  // Mismatched END label, missing END, and no blocks at all.
+  var bad1: string = "-----BEGIN CERTIFICATE-----\nAQID\n-----END PRIVATE KEY-----\n";
+  mtls_pem_iter(&it, bad1.chars, (int64)bad1.length);
+  if (mtls_pem_next(&it, &blk) != MTLS_E_DECODE) { return 6; }
+  var bad2: string = "-----BEGIN CERTIFICATE-----\nAQID\n";
+  mtls_pem_iter(&it, bad2.chars, (int64)bad2.length);
+  if (mtls_pem_next(&it, &blk) != MTLS_E_DECODE) { return 7; }
+  var bad3: string = "nothing to see";
+  mtls_pem_iter(&it, bad3.chars, (int64)bad3.length);
+  if (mtls_pem_next(&it, &blk) != 0) { return 8; }
+  mtls_pem_iter(&it, 0, 0);
+  if (mtls_pem_next(&it, &blk) != 0) { return 9; }
+  // An empty body is an error when allocating.
+  var empty: string = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n";
+  mtls_pem_iter(&it, empty.chars, (int64)empty.length);
+  if (mtls_pem_next(&it, &blk) != 1) { return 10; }
+  if (mtls_pem_decode_alloc(&blk, &der, &n) == MTLS_OK) { return 11; }
+  // Label on two lines is not a label.
+  var bad4: string = "-----BEGIN CERT\nIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+  mtls_pem_iter(&it, bad4.chars, (int64)bad4.length);
+  if (mtls_pem_next(&it, &blk) != MTLS_E_DECODE) { return 12; }
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = t_lengths();
+  if (rc != 0) { println("lengths: {rc}"); return 32 + rc; }
+  rc = t_integers();
+  if (rc != 0) { println("integers: {rc}"); return 64 + rc; }
+  rc = t_simple_types();
+  if (rc != 0) { println("simple types: {rc}"); return 96 + rc; }
+  rc = t_time();
+  if (rc != 0) { println("time: {rc}"); return 128 + rc; }
+  rc = t_base64();
+  if (rc != 0) { println("base64: {rc}"); return 160 + rc; }
+  rc = t_pem_blocks();
+  if (rc != 0) { println("pem blocks: {rc}"); return 192 + rc; }
+  println("x509 der: ok");
+  return 0;
+}

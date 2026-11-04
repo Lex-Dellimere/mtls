@@ -1,0 +1,465 @@
+// Chain verification against openssl-made Ed25519 chains: dates, names,
+// purposes, CA rules, path length, name constraints, pins and the path
+// search. ECDSA and RSA chains are checked for the right refusal until
+// cryptex can verify them.
+
+import "std/io";
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/hash";
+import "mtls/crypto/sig";
+import "mtls/x509/x509";
+import "data/x509/fixtures";
+
+// 2030-01-01: inside every "good" window, after "expired", before "future".
+fn now() -> int64 {
+  return mtls_der_unix(2030, 1, 1, 0, 0, 0);
+}
+
+// One verification run: the leaf, up to three other certificates, a host
+// ("" skips the check) and a purpose. Returns the detail code, or -1 when
+// the status and the detail disagree.
+struct Run {
+  roots: MtlsRoots;
+  res: MtlsVerifyResult;
+  opts: MtlsVerifyOpts;
+  status: int32;
+}
+
+fn run_with(r: Run*, leaf: string, i1: string, i2: string, i3: string, host: string, purpose: int32) -> int32 {
+  var b0: uint8[4096];
+  var b1: uint8[4096];
+  var b2: uint8[4096];
+  var b3: uint8[4096];
+  var refs: MtlsDerRef[3];
+  var n0: int64 = mtls_t_pem_der(leaf, &b0[0], 4096);
+  var ninter: int32 = 0;
+  if (i1.length > (uint64)0) {
+    refs[ninter].p = &b1[0];
+    refs[ninter].n = mtls_t_pem_der(i1, &b1[0], 4096);
+    ninter = ninter + 1;
+  }
+  if (i2.length > (uint64)0) {
+    refs[ninter].p = &b2[0];
+    refs[ninter].n = mtls_t_pem_der(i2, &b2[0], 4096);
+    ninter = ninter + 1;
+  }
+  if (i3.length > (uint64)0) {
+    refs[ninter].p = &b3[0];
+    refs[ninter].n = mtls_t_pem_der(i3, &b3[0], 4096);
+    ninter = ninter + 1;
+  }
+  r->opts.now = now();
+  r->opts.hostname = host;
+  r->opts.purpose = purpose;
+  r->status = mtls_chain_verify(&r->roots, &b0[0], n0, &refs[0], ninter, &r->opts, &r->res);
+  if ((r->status == MTLS_OK) != (r->res.detail == MTLS_CV_OK)) { return -1; }
+  if (r->status != MTLS_OK && r->status != MTLS_E_CERT) { return -1; }
+  return r->res.detail;
+}
+
+fn run(r: Run*, leaf: string, i1: string, i2: string, host: string, purpose: int32) -> int32 {
+  return run_with(r, leaf, i1, i2, "", host, purpose);
+}
+
+fn start(r: Run*, root1: string, root2: string) {
+  memset(r, 0, (int64)sizeof(Run));
+  mtls_roots_init(&r->roots);
+  mtls_roots_add_pem(&r->roots, root1.chars, (int64)root1.length);
+  if (root2.length > (uint64)0) {
+    mtls_roots_add_pem(&r->roots, root2.chars, (int64)root2.length);
+  }
+}
+
+fn t_basic() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  if (r.roots.count != 1) { return 1; }
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  var cli: int32 = MTLS_PURPOSE_CLIENT;
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_OK) { return 2; }
+  if (r.res.leaf.kind != MTLS_KEY_ED25519 || r.res.leaf.keylen != 32) { return 3; }
+  // The key points into the leaf DER and equals the parsed key.
+  var b: uint8[4096];
+  var c: MtlsCert;
+  var n: int64 = mtls_t_pem_der(MTLS_T_LEAF_PEM, &b[0], 4096);
+  if (mtls_cert_parse(&c, &b[0], n) != MTLS_OK) { return 4; }
+  var spki: uint8[32];
+  mtls_cert_spki_sha256(&c, &spki[0]);
+  if (memcmp(&spki[0], &r.res.leaf_spki_sha256[0], 32) != 0) { return 5; }
+  if (memcmp(r.res.leaf.key, c.pub.key, 32) != 0) { return 6; }
+  // The same chain for a client, with no host name, and with extra certs.
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "", cli) != MTLS_CV_OK) { return 7; }
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_ROOT_PEM, MTLS_T_INTER_PEM, "example.test", srv) != MTLS_CV_OK) { return 8; }
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_ROOT2_PEM, MTLS_T_INTER_PEM, "example.test", srv) != MTLS_CV_OK) { return 9; }
+  // The intermediate missing, no roots, and the wrong root.
+  if (run(&r, MTLS_T_LEAF_PEM, "", "", "example.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 10; }
+  if (mtls_chain_verify(&r.roots, &b[0], n, 0, 0, &r.opts, &r.res) != MTLS_E_CERT) { return 11; }
+  mtls_roots_free(&r.roots);
+  start(&r, MTLS_T_ROOT2_PEM, "");
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 12; }
+  if (r.res.depth != 1) { return 13; }
+  mtls_roots_free(&r.roots);
+  mtls_roots_init(&r.roots);
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 14; }
+  mtls_roots_free(&r.roots);
+  // The intermediate as the trust anchor.
+  start(&r, MTLS_T_INTER_PEM, "");
+  if (run(&r, MTLS_T_LEAF_PEM, "", "", "example.test", srv) != MTLS_CV_OK) { return 15; }
+  if (run(&r, MTLS_T_LEAF_OTHERROOT_PEM, "", "", "example.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 16; }
+  mtls_roots_free(&r.roots);
+  // A signed-by-someone-else leaf with the right names.
+  start(&r, MTLS_T_ROOT_PEM, MTLS_T_ROOT2_PEM);
+  if (r.roots.count != 2) { return 17; }
+  if (run(&r, MTLS_T_LEAF_OTHERROOT_PEM, "", "", "example.test", srv) != MTLS_CV_OK) { return 18; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_names_purposes() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  var cli: int32 = MTLS_PURPOSE_CLIENT;
+  var leaf: string = MTLS_T_LEAF_PEM;
+  var inter: string = MTLS_T_INTER_PEM;
+  if (run(&r, leaf, inter, "", "www.example.test", srv) != MTLS_CV_NAME_MISMATCH) { return 1; }
+  if (r.res.depth != 0) { return 2; }
+  if (run(&r, leaf, inter, "", "x.wild.test", srv) != MTLS_CV_OK) { return 3; }
+  if (run(&r, leaf, inter, "", "wild.test", srv) != MTLS_CV_NAME_MISMATCH) { return 4; }
+  if (run(&r, leaf, inter, "", "192.0.2.1", srv) != MTLS_CV_OK) { return 5; }
+  if (run(&r, leaf, inter, "", "192.0.2.9", srv) != MTLS_CV_NAME_MISMATCH) { return 6; }
+  if (run(&r, leaf, inter, "", "2001:db8::1", srv) != MTLS_CV_OK) { return 7; }
+  // Purposes.
+  if (run(&r, MTLS_T_LEAF_CLIENTONLY_PEM, inter, "", "example.test", srv) != MTLS_CV_EKU) { return 8; }
+  if (run(&r, MTLS_T_LEAF_CLIENTONLY_PEM, inter, "", "example.test", cli) != MTLS_CV_OK) { return 9; }
+  if (run(&r, MTLS_T_LEAF_ANYEKU_PEM, inter, "", "example.test", srv) != MTLS_CV_OK) { return 10; }
+  if (run(&r, MTLS_T_LEAF_NOEKU_PEM, inter, "", "example.test", srv) != MTLS_CV_OK) { return 11; }
+  if (run(&r, MTLS_T_LEAF_NOEKU_PEM, inter, "", "example.test", cli) != MTLS_CV_OK) { return 12; }
+  // A CA limited to client auth blocks server leaves below it.
+  if (run(&r, MTLS_T_LEAF_UNDER_CLIENTCA_PEM, MTLS_T_CLIENTCA_PEM, "", "example.test", srv) != MTLS_CV_EKU) { return 13; }
+  if (r.res.depth != 1) { return 14; }
+  if (run(&r, MTLS_T_LEAF_UNDER_CLIENTCA_PEM, MTLS_T_CLIENTCA_PEM, "", "example.test", cli) != MTLS_CV_OK) { return 15; }
+  // Bad purpose argument.
+  if (run(&r, leaf, inter, "", "", 7) != MTLS_CV_BAD_ARG) { return 16; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_dates() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  var inter: string = MTLS_T_INTER_PEM;
+  if (run(&r, MTLS_T_LEAF_EXPIRED_PEM, inter, "", "example.test", srv) != MTLS_CV_EXPIRED) { return 1; }
+  if (r.res.depth != 0) { return 2; }
+  if (run(&r, MTLS_T_LEAF_FUTURE_PEM, inter, "", "example.test", srv) != MTLS_CV_NOT_YET_VALID) { return 3; }
+  // Same chain, other clocks.
+  var b0: uint8[4096];
+  var b1: uint8[4096];
+  var d: MtlsDerRef;
+  d.p = &b1[0];
+  d.n = mtls_t_pem_der(inter, &d.p[0], 4096);
+  var n0: int64 = mtls_t_pem_der(MTLS_T_LEAF_PEM, &b0[0], 4096);
+  r.opts.hostname = "example.test";
+  r.opts.purpose = srv;
+  r.opts.now = mtls_der_unix(2045, 1, 1, 0, 0, 0);   // the last second it is valid
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_OK) { return 4; }
+  r.opts.now = mtls_der_unix(2045, 1, 1, 0, 0, 1);
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_EXPIRED) { return 5; }
+  r.opts.now = mtls_der_unix(2024, 12, 31, 23, 59, 59);
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_NOT_YET_VALID) { return 6; }
+  r.opts.now = mtls_der_unix(2025, 1, 1, 0, 0, 0);
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_OK) { return 7; }
+  // An expired intermediate, then an expired root.
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_OLD_PEM, "", "example.test", srv) != MTLS_CV_EXPIRED) { return 8; }
+  if (r.res.depth != 1) { return 9; }
+  mtls_roots_free(&r.roots);
+  start(&r, MTLS_T_ROOT_OLD_PEM, "");
+  if (run(&r, MTLS_T_LEAF_PEM, inter, "", "example.test", srv) != MTLS_CV_EXPIRED) { return 10; }
+  if (r.res.depth != 2) { return 11; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_ca_rules() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  if (run(&r, MTLS_T_LEAF_UNDER_NOTCA_PEM, MTLS_T_NOTCA_PEM, "", "example.test", srv) != MTLS_CV_NOT_CA) { return 1; }
+  if (r.res.depth != 1) { return 2; }
+  if (run(&r, MTLS_T_LEAF_UNDER_NOKS_PEM, MTLS_T_NOKS_PEM, "", "example.test", srv) != MTLS_CV_KEY_USAGE) { return 3; }
+  // inter has pathlen 0, so a CA below it is too deep.
+  if (run(&r, MTLS_T_LEAF_UNDER_INTER2_PEM, MTLS_T_INTER2_PEM, MTLS_T_INTER_PEM, "example.test", srv) != MTLS_CV_PATH_LEN) { return 4; }
+  // pathlen 1 above pathlen 0 is fine.
+  if (run(&r, MTLS_T_LEAF_DEEP_PEM, MTLS_T_P0_PEM, MTLS_T_P1_PEM, "example.test", srv) != MTLS_CV_OK) { return 5; }
+  if (run(&r, MTLS_T_LEAF_DEEP_PEM, MTLS_T_P1_PEM, MTLS_T_P0_PEM, "example.test", srv) != MTLS_CV_OK) { return 6; }
+  // Unknown extensions: critical ones refuse, others pass.
+  if (run(&r, MTLS_T_LEAF_CRITEXT_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_UNKNOWN_CRITICAL) { return 7; }
+  if (run(&r, MTLS_T_LEAF_NONCRITEXT_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_OK) { return 8; }
+  // A non-CA as the only trust anchor is refused too.
+  mtls_roots_free(&r.roots);
+  start(&r, MTLS_T_NOTCA_PEM, "");
+  if (run(&r, MTLS_T_LEAF_UNDER_NOTCA_PEM, "", "", "example.test", srv) != MTLS_CV_NOT_CA) { return 9; }
+  mtls_roots_free(&r.roots);
+  // A version 1 root is a fine anchor.
+  start(&r, MTLS_T_ROOT_V1_PEM, "");
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_OK) { return 10; }
+  mtls_roots_free(&r.roots);
+  // Malformed pieces.
+  start(&r, MTLS_T_ROOT_PEM, "");
+  if (run(&r, MTLS_T_LEAF_DUPEXT_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_MALFORMED) { return 11; }
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_LEAF_TRAILING_PEM, "", "example.test", srv) != MTLS_CV_MALFORMED) { return 12; }
+  if (r.res.depth != 1) { return 13; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_name_constraints() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  var ca: string = MTLS_T_NCCA_PEM;
+  if (run(&r, MTLS_T_LEAF_NC_OK_PEM, ca, "", "a.permitted.test", srv) != MTLS_CV_OK) { return 1; }
+  if (run(&r, MTLS_T_LEAF_NC_OUT_PEM, ca, "", "other.test", srv) != MTLS_CV_NAME_CONSTRAINT) { return 2; }
+  if (run(&r, MTLS_T_LEAF_NC_EXCL_PEM, ca, "", "x.bad.permitted.test", srv) != MTLS_CV_NAME_CONSTRAINT) { return 3; }
+  // A wildcard has to fit the constraints for every name it could stand for.
+  if (run(&r, MTLS_T_LEAF_NC_WILD_PEM, ca, "", "", srv) != MTLS_CV_NAME_CONSTRAINT) { return 4; }
+  if (run(&r, MTLS_T_LEAF_NC_WIDEWILD_PEM, ca, "", "", srv) != MTLS_CV_NAME_CONSTRAINT) { return 5; }
+  // A critical constraint of a kind we do not evaluate refuses the chain.
+  if (run(&r, MTLS_T_LEAF_UNDER_NCMAIL_PEM, MTLS_T_NCMAIL_PEM, "", "example.test", srv) != MTLS_CV_NAME_CONSTRAINT) { return 6; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_signatures() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  var b0: uint8[4096];
+  var b1: uint8[4096];
+  var d: MtlsDerRef;
+  d.p = &b1[0];
+  d.n = mtls_t_pem_der(MTLS_T_INTER_PEM, &b1[0], 4096);
+  var n0: int64 = mtls_t_pem_der(MTLS_T_LEAF_PEM, &b0[0], 4096);
+  r.opts.now = now();
+  r.opts.hostname = "example.test";
+  r.opts.purpose = MTLS_PURPOSE_SERVER;
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_OK) { return 1; }
+  // Flip a bit in the leaf's signature (the last byte of the DER).
+  b0[n0 - 1] = b0[n0 - 1] ^ (uint8)1;
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_BAD_SIGNATURE) { return 2; }
+  b0[n0 - 1] = b0[n0 - 1] ^ (uint8)1;
+  // Flip a bit in the signed part: the serial number.
+  var c: MtlsCert;
+  if (mtls_cert_parse(&c, &b0[0], n0) != MTLS_OK) { return 3; }
+  var sbyte: uint8* = c.serial + (c.seriallen - 1);
+  *sbyte = *sbyte ^ (uint8)1;
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_BAD_SIGNATURE) { return 4; }
+  if (r.res.depth != 1) { return 5; }
+  *sbyte = *sbyte ^ (uint8)1;
+  // Damaged intermediate signature.
+  b1[d.n - 1] = b1[d.n - 1] ^ (uint8)1;
+  if (mtls_chain_verify(&r.roots, &b0[0], n0, &d, 1, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_BAD_SIGNATURE) { return 6; }
+  if (r.res.depth != 2) { return 7; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_path_search() -> int32 {
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  // A decoy with the intermediate's name but another key comes first.
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_EVIL_PEM, MTLS_T_INTER_PEM, "example.test", srv) != MTLS_CV_OK) { return 1; }
+  // With only the decoy, the signature is what fails.
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_EVIL_PEM, "", "example.test", srv) != MTLS_CV_BAD_SIGNATURE) { return 2; }
+  // Two CAs that certify each other: the search ends.
+  if (run(&r, MTLS_T_LEAF_LOOP_PEM, MTLS_T_LOOPX_PEM, MTLS_T_LOOPY1_PEM, "example.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 3; }
+  // The same certificate sent many times is not a problem.
+  if (run_with(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, MTLS_T_INTER_PEM, MTLS_T_INTER_PEM, "example.test", srv) != MTLS_CV_OK) { return 4; }
+  // More intermediates than we take.
+  var b: uint8[4096];
+  var refs: MtlsDerRef[17];
+  var n: int64 = mtls_t_pem_der(MTLS_T_LEAF_PEM, &b[0], 4096);
+  for i in 0..17 {
+    refs[i].p = &b[0];
+    refs[i].n = n;
+  }
+  if (mtls_chain_verify(&r.roots, &b[0], n, &refs[0], 17, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_TOO_LONG) { return 5; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_direct_and_pins() -> int32 {
+  var r: Run;
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  // A self-signed certificate that is itself in the store.
+  start(&r, MTLS_T_SELFLEAF_PEM, "");
+  if (run(&r, MTLS_T_SELFLEAF_PEM, "", "", "self.test", srv) != MTLS_CV_OK) { return 1; }
+  if (run(&r, MTLS_T_SELFLEAF_PEM, "", "", "other.test", srv) != MTLS_CV_NAME_MISMATCH) { return 2; }
+  mtls_roots_free(&r.roots);
+  start(&r, MTLS_T_ROOT_PEM, "");
+  if (run(&r, MTLS_T_SELFLEAF_PEM, "", "", "self.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 3; }
+  // Adding the same certificate twice stores it once.
+  mtls_roots_free(&r.roots);
+  start(&r, MTLS_T_ROOT_PEM, MTLS_T_ROOT_PEM);
+  if (r.roots.count != 1) { return 4; }
+  mtls_roots_free(&r.roots);
+
+  // Pins. First learn the right one from a good run.
+  start(&r, MTLS_T_ROOT_PEM, "");
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_OK) { return 5; }
+  var pin: uint8[32];
+  memcpy(&pin[0], &r.res.leaf_spki_sha256[0], 32);
+  var empty: MtlsRoots;
+  mtls_roots_init(&empty);
+  var b: uint8[4096];
+  var n: int64 = mtls_t_pem_der(MTLS_T_LEAF_EXPIRED_PEM, &b[0], 4096);
+  var o: MtlsVerifyOpts;
+  var res: MtlsVerifyResult;
+  memset(&o, 0, (int64)sizeof(MtlsVerifyOpts));
+  o.now = now();
+  o.purpose = srv;
+  o.hostname = "not.the.host";
+  o.pin_mode = MTLS_PIN_ONLY;
+  memcpy(&o.pin[0], &pin[0], 32);
+  // Pin only: no roots, an expired leaf and the wrong host all pass.
+  if (mtls_chain_verify(&empty, &b[0], n, 0, 0, &o, &res) != MTLS_OK || res.leaf.kind != MTLS_KEY_ED25519) { return 6; }
+  // A pin that does not match.
+  o.pin[5] = o.pin[5] ^ (uint8)1;
+  if (mtls_chain_verify(&empty, &b[0], n, 0, 0, &o, &res) != MTLS_E_CERT || res.detail != MTLS_CV_PIN_MISMATCH) { return 7; }
+  o.pin[5] = o.pin[5] ^ (uint8)1;
+  // Pin and chain: the chain checks still apply.
+  o.pin_mode = MTLS_PIN_AND_CHAIN;
+  if (mtls_chain_verify(&empty, &b[0], n, 0, 0, &o, &res) != MTLS_E_CERT || res.detail != MTLS_CV_EXPIRED) { return 8; }
+  n = mtls_t_pem_der(MTLS_T_LEAF_PEM, &b[0], 4096);
+  var b2: uint8[4096];
+  var d: MtlsDerRef;
+  d.p = &b2[0];
+  d.n = mtls_t_pem_der(MTLS_T_INTER_PEM, &b2[0], 4096);
+  if (mtls_chain_verify(&r.roots, &b[0], n, &d, 1, &o, &res) != MTLS_E_CERT || res.detail != MTLS_CV_NAME_MISMATCH) { return 9; }
+  o.hostname = "example.test";
+  if (mtls_chain_verify(&r.roots, &b[0], n, &d, 1, &o, &res) != MTLS_OK) { return 10; }
+  if (mtls_chain_verify(&empty, &b[0], n, &d, 1, &o, &res) != MTLS_E_CERT || res.detail != MTLS_CV_UNKNOWN_ISSUER) { return 11; }
+  o.pin[0] = o.pin[0] ^ (uint8)1;
+  if (mtls_chain_verify(&r.roots, &b[0], n, &d, 1, &o, &res) != MTLS_E_CERT || res.detail != MTLS_CV_PIN_MISMATCH) { return 12; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+// ECDSA and RSA certificates: verification is OK once cryptex supports the
+// algorithm, until then the refusal has to be the "unsupported" one, never
+// "bad signature".
+fn ok_or_unsupported(d: int32) -> bool {
+  return d == MTLS_CV_OK || d == MTLS_CV_UNSUPPORTED_SIG;
+}
+
+fn t_ec_rsa() -> int32 {
+  var r: Run;
+  var srv: int32 = MTLS_PURPOSE_SERVER;
+  start(&r, MTLS_T_EC256_ROOT_PEM, MTLS_T_EC384_ROOT_PEM);
+  if (!ok_or_unsupported(run(&r, MTLS_T_EC256_LEAF_PEM, "", "", "example.test", srv))) { return 1; }
+  if (!ok_or_unsupported(run(&r, MTLS_T_EC384_LEAF_PEM, "", "", "example.test", srv))) { return 2; }
+  mtls_roots_free(&r.roots);
+  start(&r, MTLS_T_RSA_ROOT_PEM, "");
+  if (!ok_or_unsupported(run(&r, MTLS_T_RSA_LEAF_PEM, "", "", "example.test", srv))) { return 3; }
+  if (!ok_or_unsupported(run(&r, MTLS_T_RSA_LEAF_SHA384_PEM, "", "", "example.test", srv))) { return 4; }
+  if (!ok_or_unsupported(run(&r, MTLS_T_RSA_LEAF_SHA512_PEM, "", "", "example.test", srv))) { return 5; }
+  if (!ok_or_unsupported(run(&r, MTLS_T_RSA_LEAF_PSS_PEM, "", "", "example.test", srv))) { return 6; }
+  // A PSS salt we do not accept is always refused.
+  if (run(&r, MTLS_T_RSA_LEAF_PSS20_PEM, "", "", "example.test", srv) != MTLS_CV_UNSUPPORTED_SIG) { return 7; }
+  mtls_roots_free(&r.roots);
+  // RSA 1024 never verifies.
+  start(&r, MTLS_T_RSA1024_ROOT_PEM, "");
+  if (run(&r, MTLS_T_RSA1024_LEAF_PEM, "", "", "example.test", srv) != MTLS_CV_WEAK_KEY) { return 8; }
+  mtls_roots_free(&r.roots);
+  // An EC root does not help with a chain that names another issuer.
+  start(&r, MTLS_T_EC256_ROOT_PEM, "");
+  if (run(&r, MTLS_T_LEAF_PEM, MTLS_T_INTER_PEM, "", "example.test", srv) != MTLS_CV_UNKNOWN_ISSUER) { return 9; }
+  mtls_roots_free(&r.roots);
+  return 0;
+}
+
+fn t_text() -> int32 {
+  for d in 0..19 {
+    var t: string = mtls_cv_text(d);
+    if (t.length == (uint64)0 || t == "unknown certificate error") { return 1; }
+  }
+  if (mtls_cv_text(99) != "unknown certificate error") { return 2; }
+  if (mtls_cv_alert(MTLS_CV_EXPIRED) != MTLS_ALERT_CERTIFICATE_EXPIRED) { return 3; }
+  if (mtls_cv_alert(MTLS_CV_UNKNOWN_ISSUER) != MTLS_ALERT_UNKNOWN_CA) { return 4; }
+  if (mtls_cv_alert(MTLS_CV_BAD_SIGNATURE) != MTLS_ALERT_BAD_CERTIFICATE) { return 5; }
+  if (mtls_cv_alert(MTLS_CV_OK) != 0) { return 6; }
+  // No result struct: argument error, no crash.
+  if (mtls_chain_verify(0, 0, 0, 0, 0, 0, 0) != MTLS_E_ARG) { return 7; }
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  if (mtls_chain_verify(&r.roots, 0, 0, 0, 0, &r.opts, &r.res) != MTLS_E_CERT || r.res.detail != MTLS_CV_BAD_ARG) { return 8; }
+  mtls_roots_free(&r.roots);
+  // Roots: junk is counted, not fatal.
+  var junk: string = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n-----BEGIN RSA PRIVATE KEY-----\nAQID\n-----END RSA PRIVATE KEY-----\n";
+  var rs: MtlsRoots;
+  mtls_roots_init(&rs);
+  if (mtls_roots_add_pem(&rs, junk.chars, (int64)junk.length) != 0 || rs.count != 0 || rs.skipped != 1) { return 9; }
+  if (mtls_roots_add_pem(&rs, MTLS_T_LEAF_BUNDLE_PEM.chars, (int64)MTLS_T_LEAF_BUNDLE_PEM.length) != 1 || rs.count != 1) { return 10; }
+  mtls_roots_free(&rs);
+  return 0;
+}
+
+// A server's PEM file (leaf, then intermediate) becomes a list that verifies.
+fn t_certlist() -> int32 {
+  var a: string = MTLS_T_LEAF_PEM;
+  var b: string = MTLS_T_INTER_PEM;
+  var text: uint8* = malloc((int64)(a.length + b.length) + 16);
+  memcpy(text, a.chars, (int64)a.length);
+  memcpy(text + (int64)a.length, "# between\r\n".chars, 11);
+  memcpy(text + (int64)a.length + 11, b.chars, (int64)b.length);
+  var tl: int64 = (int64)(a.length + b.length) + 11;
+  var l: MtlsCertList;
+  if (mtls_certlist_from_pem(&l, text, tl) != 2 || l.count != 2) { return 1; }
+  var r: Run;
+  start(&r, MTLS_T_ROOT_PEM, "");
+  r.opts.now = now();
+  r.opts.hostname = "example.test";
+  r.opts.purpose = MTLS_PURPOSE_SERVER;
+  if (mtls_chain_verify(&r.roots, l.refs[0].p, l.refs[0].n, &l.refs[1], 1, &r.opts, &r.res) != MTLS_OK) { return 2; }
+  mtls_certlist_free(&l);
+  if (l.count != 0 || l.buf != 0) { return 3; }
+  // No certificates, and a broken one.
+  var key: string = MTLS_T_LEAF_KEY;
+  if (mtls_certlist_from_pem(&l, key.chars, (int64)key.length) != MTLS_E_DECODE) { return 4; }
+  var junk: string = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+  if (mtls_certlist_from_pem(&l, junk.chars, (int64)junk.length) != MTLS_E_DECODE) { return 5; }
+  if (l.buf != 0 || l.refs != 0) { return 6; }
+  mtls_roots_free(&r.roots);
+  free(text);
+  return 0;
+}
+
+fn main() -> int32 {
+  var rc: int32 = t_basic();
+  if (rc != 0) { println("basic: {rc}"); return 16 + rc; }
+  rc = t_names_purposes();
+  if (rc != 0) { println("names and purposes: {rc}"); return 48 + rc; }
+  rc = t_dates();
+  if (rc != 0) { println("dates: {rc}"); return 80 + rc; }
+  rc = t_ca_rules();
+  if (rc != 0) { println("CA rules: {rc}"); return 112 + rc; }
+  rc = t_name_constraints();
+  if (rc != 0) { println("name constraints: {rc}"); return 144 + rc; }
+  rc = t_signatures();
+  if (rc != 0) { println("signatures: {rc}"); return 160 + rc; }
+  rc = t_path_search();
+  if (rc != 0) { println("path search: {rc}"); return 176 + rc; }
+  rc = t_direct_and_pins();
+  if (rc != 0) { println("direct trust and pins: {rc}"); return 192 + rc; }
+  rc = t_ec_rsa();
+  if (rc != 0) { println("ecdsa and rsa: {rc}"); return 224 + rc; }
+  rc = t_text();
+  if (rc != 0) { println("text and arguments: {rc}"); return 240 + rc; }
+  rc = t_certlist();
+  if (rc != 0) { println("certificate lists: {rc}"); return 248 + rc; }
+  println("x509 verify: ok");
+  return 0;
+}

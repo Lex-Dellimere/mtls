@@ -1,0 +1,172 @@
+// Blocking TLS over a std/socket file descriptor.
+//
+//   var s: MtlsStream;
+//   if (mtls_stream_client(&s, fd, &cfg, "example.com") != MTLS_OK) { ... }
+//   mtls_stream_write(&s, p, n); mtls_stream_read(&s, buf, cap);
+//   mtls_stream_close(&s);
+//
+// For an event loop (alph's reactor) use the MtlsConn calls directly, or
+// the mtls_stream_pump helpers on a non-blocking socket.
+
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "mtls/core/err";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+import "mtls/tls/client";
+import "mtls/tls/engine";
+
+export struct MtlsStream {
+  fd: int64;
+  c: MtlsConn*;
+  owns_fd: bool;
+}
+
+/// mtls_stream_flush: sends everything queued. Waits on a non-blocking
+/// socket. Returns MTLS_OK or MTLS_E_IO.
+export fn mtls_stream_flush(s: MtlsStream*) -> int32 {
+  var p: uint8* = (uint8*)0;
+  var n: int64 = mtls_conn_out_peek(s->c, &p);
+  while (n > 0) {
+    var r: int64 = sock_send_all(s->fd, p, n);
+    if (r < 0) { return MTLS_E_IO; }
+    mtls_conn_out_done(s->c, n);
+    n = mtls_conn_out_peek(s->c, &p);
+  }
+  return MTLS_OK;
+}
+
+// Reads once from the socket into the connection. Returns MTLS_OK,
+// MTLS_E_EOF, MTLS_E_TIMEOUT, MTLS_E_IO or the connection's error.
+fn mtls_stream_fill(s: MtlsStream*) -> int32 {
+  var p: uint8* = (uint8*)0;
+  var room: int64 = mtls_conn_in_space(s->c, &p);
+  if (room == 0) { return mtls_conn_process(s->c); }
+  while (true) {
+    var r: int64 = sock_recv(s->fd, p, room);
+    if (r == -NET_EINTR) { continue; }
+    if (r == -NET_EAGAIN) { return MTLS_E_TIMEOUT; }
+    if (r < 0) { return MTLS_E_IO; }
+    if (r == 0) { return MTLS_E_EOF; }
+    return mtls_conn_in_commit(s->c, r);
+  }
+  return MTLS_E_IO;
+}
+
+/// mtls_stream_handshake: runs the handshake to the end.
+export fn mtls_stream_handshake(s: MtlsStream*) -> int32 {
+  while (mtls_conn_handshaking(s->c)) {
+    if (mtls_stream_flush(s) != MTLS_OK) { return MTLS_E_IO; }
+    if (!mtls_conn_handshaking(s->c)) { break; }
+    var rc: int32 = mtls_stream_fill(s);
+    if (rc != MTLS_OK && mtls_conn_handshaking(s->c)) {
+      mtls_stream_flush(s);
+      if (mtls_conn_error(s->c) != 0) { return mtls_conn_error(s->c); }
+      return rc;
+    }
+  }
+  mtls_stream_flush(s);
+  return mtls_conn_error(s->c);
+}
+
+fn mtls_stream_init(s: MtlsStream*, fd: int64, c: MtlsConn*) -> int32 {
+  s->fd = fd;
+  s->c = c;
+  s->owns_fd = false;
+  if (c == 0) { return MTLS_E_NOMEM; }
+  return MTLS_OK;
+}
+
+/// mtls_stream_client: TLS client handshake on a connected socket.
+export fn mtls_stream_client(s: MtlsStream*, fd: int64, cfg: MtlsConfig*, host: string) -> int32 {
+  var rc: int32 = mtls_stream_init(s, fd, mtls_client_new(cfg));
+  if (rc != MTLS_OK) { return rc; }
+  rc = mtls_client_start(s->c, host);
+  if (rc != MTLS_OK) { return rc; }
+  return mtls_stream_handshake(s);
+}
+
+/// mtls_stream_server: TLS server handshake on an accepted socket.
+export fn mtls_stream_server(s: MtlsStream*, fd: int64, cfg: MtlsConfig*) -> int32 {
+  var rc: int32 = mtls_stream_init(s, fd, mtls_server_new(cfg));
+  if (rc != MTLS_OK) { return rc; }
+  return mtls_stream_handshake(s);
+}
+
+/// mtls_stream_read: reads application data, waiting for it. Returns the
+/// count, 0 at a clean end, or a negative error (MTLS_E_EOF if the peer
+/// closed the socket without close_notify: the data may be cut short).
+export fn mtls_stream_read(s: MtlsStream*, dst: uint8*, cap: int64) -> int64 {
+  while (true) {
+    var r: int64 = mtls_conn_read(s->c, dst, cap);
+    mtls_stream_flush(s);
+    if (r != (int64)MTLS_E_WANT_IO) { return r; }
+    var rc: int32 = mtls_stream_fill(s);
+    if (rc != MTLS_OK) {
+      mtls_stream_flush(s);
+      r = mtls_conn_read(s->c, dst, cap);
+      if (r != (int64)MTLS_E_WANT_IO) { return r; }
+      return (int64)rc;
+    }
+  }
+  return (int64)MTLS_E_IO;
+}
+
+/// mtls_stream_write: sends all n bytes. Returns n or a negative error.
+export fn mtls_stream_write(s: MtlsStream*, src: uint8*, n: int64) -> int64 {
+  var done: int64 = 0;
+  while (done < n) {
+    var k: int64 = n - done;
+    if (k > 65536) { k = 65536; }
+    var r: int64 = mtls_conn_write(s->c, src + done, k);
+    if (r < 0) { return r; }
+    if (mtls_stream_flush(s) != MTLS_OK) { return (int64)MTLS_E_IO; }
+    done = done + r;
+  }
+  return n;
+}
+
+/// mtls_stream_write_str: mtls_stream_write for a string.
+export fn mtls_stream_write_str(s: MtlsStream*, text: string) -> int64 {
+  return mtls_stream_write(s, text.chars, (int64)text.length);
+}
+
+/// mtls_stream_close: sends close_notify, frees the connection, and
+/// closes the socket if the stream owns it.
+export fn mtls_stream_close(s: MtlsStream*) {
+  if (s->c != 0) {
+    mtls_conn_close(s->c);
+    mtls_stream_flush(s);
+    mtls_conn_free(s->c);
+    s->c = (MtlsConn*)0;
+  }
+  if (s->owns_fd && s->fd >= 0) {
+    sock_close(s->fd);
+    s->fd = -1;
+  }
+}
+
+/// mtls_dial: connects to host:port and runs the client handshake. The
+/// stream owns the socket. On failure *err holds the MTLS_E_* code.
+export fn mtls_dial(s: MtlsStream*, host: string, port: int32, cfg: MtlsConfig*, timeout_ms: int64) -> int32 {
+  memset(s, 0, (int64)sizeof(MtlsStream));
+  s->fd = -1;
+  match (tcp_connect(host, port, timeout_ms)) {
+    case Ok(fd): {
+      s->fd = fd;
+    }
+    case Err(e): {
+      return MTLS_E_IO;
+    }
+  }
+  if (timeout_ms > 0) { sock_set_timeout(s->fd, timeout_ms, timeout_ms); }
+  var fd: int64 = s->fd;
+  var rc: int32 = mtls_stream_client(s, fd, cfg, host);
+  s->owns_fd = true;
+  if (rc != MTLS_OK) {
+    mtls_stream_close(s);
+    return rc;
+  }
+  return MTLS_OK;
+}

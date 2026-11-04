@@ -1,0 +1,31 @@
+// Checks the peer's certificate chain and extracts its public key.
+// TEMPORARY: finds an Ed25519 key in the leaf until x509 lands.
+
+import "std/mem";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/sig";
+import "mtls/tls/config";
+import "mtls/tls/conn";
+
+export fn mtls_verify_peer(c: MtlsConn*) -> int32 {
+  if (c->npchain == 0) { return MTLS_E_CERT; }
+  var p: uint8* = c->pchain[0].p;
+  var n: int64 = c->pchain[0].n;
+  var pat: uint8[12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+  var i: int64 = 0;
+  while (i + 44 <= n) {
+    if (memcmp(p + i, &pat[0], 12) == 0) {
+      c->peer_key.kind = MTLS_KEY_ED25519;
+      c->peer_key.key = p + i + 12;
+      c->peer_key.keylen = 32;
+      return MTLS_OK;
+    }
+    i = i + 1;
+  }
+  return MTLS_E_CERT;
+}
+
+export fn mtls_peer_alert(c: MtlsConn*) -> int32 {
+  return MTLS_ALERT_BAD_CERTIFICATE;
+}

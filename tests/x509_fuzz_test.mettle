@@ -1,0 +1,271 @@
+// Robustness: every fixture is cut short and has bytes changed, removed and
+// replaced at every position, and the parsers have to come back without
+// crashing, without pointers outside the input, and without accepting a
+// changed leaf certificate as valid. Each mutated copy sits in a block of
+// exactly its own size, so a read past the end shows up under `mettle
+// --safe` (see the note at the end of the file).
+
+import "std/io";
+import "std/mem";
+import "std/bench";
+import "mtls/core/err";
+import "mtls/core/bytes";
+import "mtls/crypto/sig";
+import "mtls/x509/x509";
+import "data/x509/fixtures";
+
+var g_parsed: int64 = 0;      // mutated certificates that still parse
+var g_keys: int64 = 0;        // mutated keys that still load
+var g_runs: int64 = 0;
+var g_insane: int64 = 0;      // certificates whose pointers left their input
+
+fn inside(p: uint8*, n: int64, base: uint8*, blen: int64) -> bool {
+  if (n < 0) { return false; }
+  return (int64)p >= (int64)base && (int64)p + n <= (int64)base + blen;
+}
+
+fn cert_sane(c: MtlsCert*, base: uint8*, blen: int64) -> bool {
+  if (!inside(c->tbs, c->tbslen, base, blen) || !inside(c->sig, c->siglen, base, blen)) { return false; }
+  if (!inside(c->serial, c->seriallen, base, blen) || !inside(c->issuer, c->issuerlen, base, blen)) { return false; }
+  if (!inside(c->subject, c->subjectlen, base, blen) || !inside(c->spki, c->spkilen, base, blen)) { return false; }
+  if (c->has_san && !inside(c->san, c->sanlen, base, blen)) { return false; }
+  if (c->nc_permlen > 0 && !inside(c->nc_perm, c->nc_permlen, base, blen)) { return false; }
+  if (c->nc_excllen > 0 && !inside(c->nc_excl, c->nc_excllen, base, blen)) { return false; }
+  if (c->skilen > 0 && !inside(c->ski, c->skilen, base, blen)) { return false; }
+  if (c->akilen > 0 && !inside(c->aki, c->akilen, base, blen)) { return false; }
+  if (c->pub.kind != MTLS_KEY_NONE) {
+    if (!inside(c->pub.key, c->pub.keylen, base, blen)) { return false; }
+    if (c->pub.kind == MTLS_KEY_RSA && !inside(c->pub.exp, c->pub.explen, base, blen)) { return false; }
+  }
+  // Everything the accessors read has to stay inside too.
+  var cn: string = mtls_cert_cn(c);
+  if (cn.length > (uint64)0 && !inside(cn.chars, (int64)cn.length, base, blen)) { return false; }
+  var r: MtlsRd = mtls_rd(c->san, c->sanlen);
+  var kind: int32 = 0;
+  var p: uint8* = 0;
+  var n: int64 = 0;
+  while (mtls_cert_san_next(&r, &kind, &p, &n)) {
+    if (!inside(p, n, base, blen)) { return false; }
+  }
+  mtls_cert_match_host(c, "example.test");
+  mtls_cert_match_host(c, "192.0.2.1");
+  return true;
+}
+
+// Reads one cert from a private copy of exactly n bytes.
+fn try_cert(src: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  var buf: uint8* = malloc(n);
+  if (buf == 0) { return; }
+  memcpy(buf, src, n);
+  var c: MtlsCert;
+  g_runs = g_runs + 1;
+  if (mtls_cert_parse(&c, buf, n) == MTLS_OK) {
+    g_parsed = g_parsed + 1;
+    if (!cert_sane(&c, buf, n)) {
+      g_insane = g_insane + 1;
+    }
+  }
+  free(buf);
+}
+
+fn try_key(src: uint8*, n: int64) {
+  if (n <= 0) { return; }
+  var buf: uint8* = malloc(n);
+  if (buf == 0) { return; }
+  memcpy(buf, src, n);
+  var k: MtlsPrivKey;
+  g_runs = g_runs + 1;
+  if (mtls_key_load(buf, n, &k) == MTLS_OK) {
+    g_keys = g_keys + 1;
+    mtls_privkey_free(&k);
+  }
+  free(buf);
+}
+
+// Generic walk: every typed reader on every element of whatever the bytes are.
+fn walk(p: uint8*, n: int64, depth: int32) -> int32 {
+  var r: MtlsRd = mtls_rd(p, n);
+  var t: MtlsDerTlv;
+  var count: int32 = 0;
+  while (mtls_rd_left(&r) > 0) {
+    var at: int64 = r.pos;
+    if (!mtls_der_tlv(&r, &t)) { break; }
+    count = count + 1;
+    var q: uint8* = 0;
+    var k: int64 = 0;
+    var v: int64 = 0;
+    var u: int32 = 0;
+    var b: bool = false;
+    var s: MtlsRd = mtls_rd(p + at, n - at);
+    mtls_der_int(&s, &q, &k);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_uint(&s, &q, &k);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_small(&s, &v);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_oid(&s, &q, &k);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_bool(&s, &b);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_bits(&s, &q, &k, &u);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_time(&s, &v);
+    s = mtls_rd(p + at, n - at);
+    mtls_der_octets(&s, &q, &k);
+    if ((t.tag & 0x20) != 0 && depth < 16) {
+      count = count + walk(t.body, t.bodylen, depth + 1);
+    }
+  }
+  return count;
+}
+
+// Cuts, changes and deletes at every position of src, calling `one` on each.
+// kind 0: certificates, 1: keys, 2: walk only.
+fn mutate(src: uint8*, n: int64, kind: int32) {
+  var tmp: uint8* = malloc(n + 1);
+  if (tmp == 0) { return; }
+  for pos in 0..n {
+    // Truncated.
+    if (kind == 0) { try_cert(src, pos); }
+    if (kind == 1) { try_key(src, pos); }
+    // Changed.
+    for m in 0..4 {
+      memcpy(tmp, src, n);
+      var old: uint8 = tmp[pos];
+      if (m == 0) { tmp[pos] = old ^ (uint8)0xff; }
+      if (m == 1) { tmp[pos] = old ^ (uint8)0x01; }
+      if (m == 2) { tmp[pos] = (uint8)0; }
+      if (m == 3) { tmp[pos] = (uint8)0x80; }
+      if (tmp[pos] == old) { continue; }
+      if (kind == 0) { try_cert(tmp, n); }
+      if (kind == 1) { try_key(tmp, n); }
+      if (kind == 2) { walk(tmp, n, 0); }
+    }
+    // One byte removed.
+    memcpy(tmp, src, pos);
+    memcpy(tmp + pos, src + pos + 1, n - pos - 1);
+    if (kind == 0) { try_cert(tmp, n - 1); }
+    if (kind == 1) { try_key(tmp, n - 1); }
+  }
+  free(tmp);
+}
+
+// A changed leaf must never verify.
+fn t_leaf_changes() -> int32 {
+  var orig: uint8[4096];
+  var inter: uint8[4096];
+  var n: int64 = mtls_t_pem_der(MTLS_T_LEAF_PEM, &orig[0], 4096);
+  var ni: int64 = mtls_t_pem_der(MTLS_T_INTER_PEM, &inter[0], 4096);
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  mtls_roots_add_pem(&roots, MTLS_T_ROOT_PEM.chars, (int64)MTLS_T_ROOT_PEM.length);
+  var d: MtlsDerRef;
+  d.p = &inter[0];
+  d.n = ni;
+  var o: MtlsVerifyOpts;
+  var res: MtlsVerifyResult;
+  memset(&o, 0, (int64)sizeof(MtlsVerifyOpts));
+  o.now = mtls_der_unix(2030, 1, 1, 0, 0, 0);
+  o.hostname = "example.test";
+  o.purpose = MTLS_PURPOSE_SERVER;
+  if (mtls_chain_verify(&roots, &orig[0], n, &d, 1, &o, &res) != MTLS_OK) { return 1; }
+  var tmp: uint8* = malloc(n + 1);
+  if (tmp == 0) { return 2; }
+  var bad: int32 = 0;
+  for pos in 0..n {
+    // Cut short.
+    var cut: uint8* = malloc(pos + 1);
+    memcpy(cut, &orig[0], pos);
+    if (mtls_chain_verify(&roots, cut, pos, &d, 1, &o, &res) == MTLS_OK) { bad = bad + 1; }
+    free(cut);
+    for m in 0..2 {
+      memcpy(tmp, &orig[0], n);
+      if (m == 0) { tmp[pos] = tmp[pos] ^ (uint8)0x01; }
+      if (m == 1) { tmp[pos] = tmp[pos] ^ (uint8)0x80; }
+      if (mtls_chain_verify(&roots, tmp, n, &d, 1, &o, &res) == MTLS_OK) { bad = bad + 1; }
+    }
+  }
+  free(tmp);
+  mtls_roots_free(&roots);
+  if (bad != 0) {
+    println("{bad} changed copies of the leaf verified");
+    return 3;
+  }
+  return 0;
+}
+
+fn main() -> int32 {
+  var checked: int32 = 0;
+  var t0: int64 = bench_time_us();
+  for i in 0..mtls_t_count() {
+    // Work on a heap copy so every byte read is inside a tracked allocation.
+    var fixture: string = mtls_t_get(i);
+    var copy: uint8* = malloc((int64)fixture.length + 1);
+    memcpy(copy, fixture.chars, (int64)fixture.length);
+    var text: string;
+    text.chars = copy;
+    text.length = fixture.length;
+    var it: MtlsPemIter;
+    var blk: MtlsPemBlock;
+    var blocks: int32 = 0;
+    if (copy[0] == (uint8)0x30) {
+      // A raw .der file: a private key.
+      mutate(text.chars, (int64)text.length, 1);
+      if (i % 2 == 0) { mutate(text.chars, (int64)text.length, 2); }
+      checked = checked + 1;
+      free(copy);
+      continue;
+    }
+    mtls_pem_iter(&it, text.chars, (int64)text.length);
+    while (mtls_pem_next(&it, &blk) == 1) {
+      var der: uint8* = 0;
+      var dl: int64 = 0;
+      if (mtls_pem_decode_alloc(&blk, &der, &dl) != MTLS_OK) { continue; }
+      blocks = blocks + 1;
+      if (blk.label == "CERTIFICATE") {
+        mutate(der, dl, 0);
+      } else {
+        mutate(der, dl, 1);
+      }
+      if (i % 6 == 0) { mutate(der, dl, 2); }
+      free(der);
+    }
+    // The PEM text itself (headers, base64, line ends) as a key file and as a
+    // trust store.
+    var raw: uint8* = malloc((int64)text.length + 1);
+    memcpy(raw, text.chars, (int64)text.length);
+    var pos: int64 = (int64)(i % 3);
+    while (pos < (int64)text.length) {
+      var old: uint8 = raw[pos];
+      raw[pos] = old ^ (uint8)0x01;
+      try_key(raw, (int64)text.length);
+      var roots: MtlsRoots;
+      mtls_roots_init(&roots);
+      mtls_roots_add_pem(&roots, raw, (int64)text.length);
+      mtls_roots_free(&roots);
+      raw[pos] = old;
+      try_key(raw, pos);
+      pos = pos + 3;
+    }
+    free(raw);
+    free(copy);
+    checked = checked + 1;
+  }
+  println("fuzz: {checked} fixtures, {g_runs} mutated inputs, {g_parsed} certificates and {g_keys} keys still parsed");
+  if (g_insane != 0) {
+    println("{g_insane} certificates have a pointer outside their input");
+    return 1;
+  }
+  var t1: int64 = bench_time_us();
+  var rc: int32 = t_leaf_changes();
+  var t2: int64 = bench_time_us();
+  println("timing: mutations {(t1 - t0) / 1000} ms, leaf changes {(t2 - t1) / 1000} ms");
+  if (rc != 0) { println("leaf changes: {rc}"); return 10 + rc; }
+  println("x509 fuzz: ok");
+  return 0;
+}
+
+// Extra check, not part of `mbuild test`: build this file with
+//   mettle --build --safe tests/x509_fuzz_test.mettle -o /tmp/fuzz
+// and run it; any access outside an allocation aborts the program.

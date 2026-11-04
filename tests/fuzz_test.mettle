@@ -1,0 +1,176 @@
+// Feeds damaged handshakes and random records to clients and servers. The
+// check is that nothing crashes, hangs or reads out of bounds (debug
+// builds check bounds): every damaged input must end in a clean failure
+// or a still-waiting connection.
+
+import "std/io";
+import "std/mem";
+import "std/env";
+import "std/conv";
+import "crypto/core/types";
+import "crypto/ecc/sign";
+import "mtls/mtls";
+
+var g_seed: uint64 = 0x9e3779b97f4a7c15;
+
+fn rnd() -> uint64 {
+  g_seed = g_seed ^ (g_seed << (uint64)13);
+  g_seed = g_seed ^ (g_seed >> (uint64)7);
+  g_seed = g_seed ^ (g_seed << (uint64)17);
+  return g_seed;
+}
+
+fn rnd_below(n: int64) -> int64 {
+  if (n <= 0) { return 0; }
+  return (int64)(rnd() % (uint64)n);
+}
+
+fn load_key(der: string, k: MtlsPrivKey*) {
+  memset(k, 0, (int64)sizeof(MtlsPrivKey));
+  var pk: CrEd25519Public;
+  var sk: CrEd25519Secret;
+  var seed: CrSeed32;
+  memcpy(&seed.b[0], der.chars + (int64)der.length - 32, 32);
+  cr_ed25519_seed_keypair(&pk, &sk, &seed);
+  k->kind = MTLS_KEY_ED25519;
+  memcpy(&k->sk[0], &sk.b[0], 64);
+}
+
+var g_c2s: uint8[65536];
+var g_c2slen: int64 = 0;
+var g_s2c: uint8[65536];
+var g_s2clen: int64 = 0;
+
+// A clean handshake, recording the first flight each way.
+fn record(ccfg: MtlsConfig*, scfg: MtlsConfig*) {
+  var c: MtlsConn* = mtls_client_new(ccfg);
+  var s: MtlsConn* = mtls_server_new(scfg);
+  mtls_client_start(c, "server.test");
+  g_c2slen = mtls_conn_take_out(c, &g_c2s[0], 65536);
+  mtls_conn_feed(s, &g_c2s[0], g_c2slen);
+  g_s2clen = mtls_conn_take_out(s, &g_s2c[0], 65536);
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+}
+
+fn mutate(src: uint8*, n: int64, dst: uint8*) -> int64 {
+  memcpy(dst, src, n);
+  var len: int64 = n;
+  var kind: int64 = rnd_below(5);
+  var count: int64 = 1 + rnd_below(4);
+  for i in 0..count {
+    if (len == 0) { break; }
+    var at: int64 = rnd_below(len);
+    if (kind == 0) {
+      dst[at] = dst[at] ^ (uint8)(1 << (int32)rnd_below(8));
+    } else if (kind == 1) {
+      dst[at] = (uint8)rnd_below(256);
+    } else if (kind == 2) {
+      len = at;
+    } else if (kind == 3) {
+      // Lengths are the most fragile fields: set one to 0 or 0xff.
+      if (rnd_below(2) == 0) { dst[at] = 0; } else { dst[at] = 255; }
+    } else {
+      // Insert a byte.
+      if (len < 65535) {
+        memmove(dst + at + 1, dst + at, len - at);
+        dst[at] = (uint8)rnd_below(256);
+        len = len + 1;
+      }
+    }
+  }
+  return len;
+}
+
+// Feeds bytes in random-sized pieces, as a network would.
+fn feed_chunks(c: MtlsConn*, p: uint8*, n: int64) {
+  var off: int64 = 0;
+  var guard: int32 = 0;
+  while (off < n && guard < 100000) {
+    var k: int64 = 1 + rnd_below(n - off);
+    var took: int64 = mtls_conn_feed(c, p + off, k);
+    if (took < 0) { return; }
+    if (took == 0) {
+      var junk: uint8[256];
+      if (mtls_conn_read(c, &junk[0], 256) < 0) { return; }
+    }
+    off = off + took;
+    guard = guard + 1;
+  }
+}
+
+fn main() -> int32 {
+  var cert_der: string = import_str "data/tls/server.der";
+  var key_der: string = import_str "data/tls/server.key.der";
+  var scfg: MtlsConfig;
+  mtls_config_init(&scfg);
+  var key: MtlsPrivKey;
+  load_key(key_der, &key);
+  var chain: MtlsDer[1];
+  chain[0].p = cert_der.chars;
+  chain[0].n = (int64)cert_der.length;
+  mtls_config_set_cert(&scfg, &chain[0], 1, &key);
+  mtls_config_add_alpn(&scfg, "h2");
+  scfg.client_auth = MTLS_CLIENT_AUTH_REQUEST;
+  var ccfg: MtlsConfig;
+  mtls_config_init(&ccfg);
+  ccfg.verify_mode = MTLS_VERIFY_NONE;
+  mtls_config_add_alpn(&ccfg, "h2");
+  var buf: uint8[70000];
+
+  // MTLS_FUZZ_ROUNDS raises the work for long runs (`mbuild fuzz`).
+  var rounds: int64 = 300;
+  match (env_get("MTLS_FUZZ_ROUNDS")) {
+    case Some(v): { rounds = str_to_i64_or(v, 300); }
+    case None: { }
+  }
+  var runs: int64 = 0;
+  for v in 0..2 {
+    if (v == 1) {
+      ccfg.max_version = MTLS_TLS12;
+    }
+    record(&ccfg, &scfg);
+    if (g_c2slen == 0 || g_s2clen == 0) { return 1; }
+    for i in 0..rounds {
+      // Damaged ClientHello into a server.
+      var n: int64 = mutate(&g_c2s[0], g_c2slen, &buf[0]);
+      var s: MtlsConn* = mtls_server_new(&scfg);
+      feed_chunks(s, &buf[0], n);
+      var out: uint8* = (uint8*)0;
+      mtls_conn_out_peek(s, &out);
+      mtls_conn_free(s);
+      // Damaged server flight into a client that is waiting for it.
+      n = mutate(&g_s2c[0], g_s2clen, &buf[0]);
+      var c: MtlsConn* = mtls_client_new(&ccfg);
+      mtls_client_start(c, "server.test");
+      mtls_conn_take_out(c, &buf[n], 4096);
+      feed_chunks(c, &buf[0], n);
+      mtls_conn_free(c);
+      runs = runs + 2;
+    }
+  }
+  // Pure noise, with valid-looking record headers half the time.
+  for i in 0..rounds {
+    var n: int64 = 1 + rnd_below(3000);
+    for j in 0..n { buf[j] = (uint8)rnd_below(256); }
+    if (rnd_below(2) == 0 && n > 5) {
+      buf[0] = (uint8)(20 + rnd_below(4));
+      buf[1] = 3;
+      buf[2] = (uint8)rnd_below(5);
+      mtls_store16(&buf[3], n - 5);
+    }
+    var c: MtlsConn* = (MtlsConn*)0;
+    if (i % 2 == 0) {
+      c = mtls_server_new(&scfg);
+    } else {
+      c = mtls_client_new(&ccfg);
+      mtls_client_start(c, "x");
+      mtls_conn_take_out(c, &buf[n], 4096);
+    }
+    feed_chunks(c, &buf[0], n);
+    mtls_conn_free(c);
+    runs = runs + 1;
+  }
+  println("fuzz ok: {runs} runs");
+  return 0;
+}
