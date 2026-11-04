@@ -1,7 +1,6 @@
 // Signatures: one place that maps TLS signature schemes and X.509
-// signature algorithms onto cryptex. Ed25519, ECDSA P-256 and RSA
-// (PKCS#1 v1.5 and PSS) verify; Ed25519 and ECDSA P-256 sign. P-384 and
-// RSA signing return MTLS_E_UNSUPPORTED until cryptex has them.
+// signature algorithms onto cryptex: Ed25519, ECDSA P-256 and P-384, and
+// RSA with PKCS#1 v1.5 or PSS padding, for both signing and verifying.
 
 import "std/mem";
 import "crypto/core/types";
@@ -9,6 +8,7 @@ import "crypto/core/status";
 import "crypto/core/util";
 import "crypto/ecc/sign";
 import "crypto/ecc/p256";
+import "crypto/ecc/p384";
 import "crypto/ecc/ecdsa";
 import "crypto/rsa/rsa";
 import "crypto/hash/hash";
@@ -129,7 +129,7 @@ export fn mtls_scheme_pad(scheme: int32) -> int32 {
 /// mtls_scheme_supported: whether this build can verify the scheme.
 export fn mtls_scheme_supported(scheme: int32) -> bool {
   var k: int32 = mtls_scheme_key(scheme);
-  return k == MTLS_KEY_ED25519 || k == MTLS_KEY_P256 || k == MTLS_KEY_RSA;
+  return k == MTLS_KEY_ED25519 || k == MTLS_KEY_P256 || k == MTLS_KEY_P384 || k == MTLS_KEY_RSA;
 }
 
 fn mtls_cr_hash(h: int32) -> int32 {
@@ -172,6 +172,11 @@ export fn mtls_verify_raw(pk: MtlsPubKey*, hash: int32, pad: int32, msg: uint8*,
     if (cr_p256_ecdsa_verify(sig, slen, msg, n, ch, pk->key, 65)) { return MTLS_OK; }
     return MTLS_E_VERIFY;
   }
+  if (pk->kind == MTLS_KEY_P384) {
+    if (pad != MTLS_PAD_NONE || pk->keylen != 97) { return MTLS_E_VERIFY; }
+    if (cr_p384_ecdsa_verify(sig, slen, msg, n, ch, pk->key, 97)) { return MTLS_OK; }
+    return MTLS_E_VERIFY;
+  }
   if (pk->kind == MTLS_KEY_RSA) {
     // Keys under 2048 bits are refused, as in every current browser.
     var bits: int64 = mtls_rsa_bits(pk->key, pk->keylen);
@@ -204,6 +209,10 @@ export fn mtls_key_can_sign(k: MtlsPrivKey*, scheme: int32) -> bool {
   // In TLS 1.2 an ECDSA scheme names only the hash; 1.3 callers pass the
   // P-256 scheme (mtls_pick_sig only offers schemes the peer accepts).
   if (k->kind == MTLS_KEY_P256 && scheme == MTLS_SIG_ECDSA_P256_SHA256) { return true; }
+  if (k->kind == MTLS_KEY_P384 && scheme == MTLS_SIG_ECDSA_P384_SHA384) { return true; }
+  // RSA signs PSS with an rsaEncryption key ("rsae"), and PKCS#1 v1.5 for
+  // TLS 1.2 peers (mtls_pick_sig keeps PKCS#1 out of TLS 1.3).
+  if (k->kind == MTLS_KEY_RSA && mtls_scheme_key(scheme) == MTLS_KEY_RSA) { return true; }
   return false;
 }
 
@@ -230,6 +239,41 @@ export fn mtls_sign(k: MtlsPrivKey*, scheme: int32, msg: uint8*, n: int64, out: 
     var rc2: int32 = cr_p256_ecdsa_sign(out, cap, olen, msg, n, mtls_cr_hash(mtls_scheme_hash(scheme)), &psk);
     cr_wipe(&psk.b[0], 32);
     if (rc2 != CR_OK) { return MTLS_E_CRYPTO; }
+    return MTLS_OK;
+  }
+  if (k->kind == MTLS_KEY_P384) {
+    var qsk: CrP384Secret;
+    memcpy(&qsk.b[0], &k->sk[0], 48);
+    var rc3: int32 = cr_p384_ecdsa_sign(out, cap, olen, msg, n, mtls_cr_hash(mtls_scheme_hash(scheme)), &qsk);
+    cr_wipe(&qsk.b[0], 48);
+    if (rc3 != CR_OK) { return MTLS_E_CRYPTO; }
+    return MTLS_OK;
+  }
+  if (k->kind == MTLS_KEY_RSA) {
+    var rk: CrRsaPrivate;
+    rk.n = k->n;
+    rk.n_len = k->nlen;
+    rk.e = k->e;
+    rk.e_len = k->elen;
+    rk.p = k->p;
+    rk.p_len = k->plen;
+    rk.q = k->q;
+    rk.q_len = k->qlen;
+    rk.dp = k->dp;
+    rk.dp_len = k->dplen;
+    rk.dq = k->dq;
+    rk.dq_len = k->dqlen;
+    rk.qinv = k->qinv;
+    rk.qinv_len = k->qinvlen;
+    var h: int32 = mtls_cr_hash(mtls_scheme_hash(scheme));
+    var rc4: int32 = CR_E_ARG;
+    if (mtls_scheme_pad(scheme) == MTLS_PAD_PSS) {
+      rc4 = cr_rsa_sign_pss(out, cap, olen, msg, n, h, &rk);
+    } else {
+      rc4 = cr_rsa_sign_pkcs1(out, cap, olen, msg, n, h, &rk);
+    }
+    if (rc4 == CR_E_SPACE) { return MTLS_E_SPACE; }
+    if (rc4 != CR_OK) { return MTLS_E_CRYPTO; }
     return MTLS_OK;
   }
   return MTLS_E_UNSUPPORTED;

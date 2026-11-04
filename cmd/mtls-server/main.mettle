@@ -9,7 +9,7 @@
 //     --require-client     ask, and refuse clients without one
 //     --alpn PROTO         accept a protocol (repeatable, in preference order)
 //     --tls12 | --tls13    only that version
-//     --groups LIST        x25519, p256 (comma separated, in order)
+//     --groups LIST        x25519, p256, p384 (comma separated, in order)
 //     --www                answer every request with a small HTTP page
 //     --count N            stop after N connections (default: run forever)
 
@@ -37,6 +37,7 @@ fn parse_groups(cfg: MtlsConfig*, list: string) -> bool {
     var g: int32 = 0;
     if (name == "x25519") { g = MTLS_GROUP_X25519; }
     if (name == "p256") { g = MTLS_GROUP_SECP256R1; }
+    if (name == "p384") { g = MTLS_GROUP_SECP384R1; }
     if (g == 0 || !mtls_kx_supported(g) || cfg->ngroups >= 4) { return false; }
     cfg->groups[cfg->ngroups] = g;
     cfg->ngroups = cfg->ngroups + 1;

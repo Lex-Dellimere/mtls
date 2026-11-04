@@ -1,7 +1,8 @@
 #!/bin/sh
 # Interop with OpenSSL: mtls-client against `openssl s_server` and
 # `openssl s_client` against mtls-server, both TLS versions, several
-# suites, mutual TLS, resumption and HelloRetryRequest.
+# suites and certificate types, mutual TLS, resumption and
+# HelloRetryRequest.
 #
 # Usage: sh tests/interop.sh BINDIR   (run from the project root;
 # `mbuild interop` builds the release tools and runs this).
@@ -50,6 +51,13 @@ ossl_server "client 1.2 ECDHE-ECDSA-CHACHA" "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1
 ossl_server "client 1.2 Ed25519 cert"      "TLS 1.2.*verified yes" "$ED -tls1_2" "--ca $D/ca.pem"
 ossl_server "client 1.2 resumption"        "resumed yes" "$EC -tls1_2" "--ca $D/ecroot.pem --resume 1"
 ossl_server "client 1.2 client cert"       "200 ok" "$EC -tls1_2 -Verify 1 -CAfile $D/ca.pem -verify_return_error" "--ca $D/ecroot.pem --cert $D/client.pem --key $D/client.key"
+RS="-cert $D/rsaserver.pem -key $D/rsaserver.key"
+P3="-cert $D/p384server.pem -key $D/p384server.key"
+ossl_server "client 1.3 RSA cert"          "TLS 1.3.*verified yes" "$RS -tls1_3" "--ca $D/rsaroot.pem"
+ossl_server "client 1.2 ECDHE-RSA-AES128"  "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.*verified yes" "$RS -tls1_2 -cipher ECDHE-RSA-AES128-GCM-SHA256" "--ca $D/rsaroot.pem"
+ossl_server "client 1.2 ECDHE-RSA-CHACHA"  "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" "$RS -tls1_2 -cipher ECDHE-RSA-CHACHA20-POLY1305" "--ca $D/rsaroot.pem"
+ossl_server "client 1.3 P-384 cert"        "TLS 1.3.*verified yes" "$P3 -tls1_3" "--ca $D/p384root.pem"
+ossl_server "client 1.3 P-384 share"       "TLS 1.3.*verified yes" "$P3 -tls1_3 -groups P-384" "--ca $D/p384root.pem --groups p384"
 ossl_server "client refuses wrong CA"      "certificate: unknown issuer" "$EC -tls1_3" "--ca $D/ca.pem"
 
 # openssl s_client -> mtls-server
@@ -85,6 +93,14 @@ mtls_server "server 1.2 ECDHE-ECDSA-AES128" "Cipher is ECDHE-ECDSA-AES128-GCM-SH
 mtls_server "server 1.2 ECDHE-ECDSA-AES256" "Cipher is ECDHE-ECDSA-AES256-GCM-SHA384" "$SEC" "-CAfile $D/ecroot.pem -tls1_2 -cipher ECDHE-ECDSA-AES256-GCM-SHA384"
 mtls_server "server 1.2 ECDHE-ECDSA-CHACHA" "Cipher is ECDHE-ECDSA-CHACHA20-POLY1305" "$SEC" "-CAfile $D/ecroot.pem -tls1_2 -cipher ECDHE-ECDSA-CHACHA20-POLY1305"
 mtls_server "server 1.2 Ed25519 cert"  "Verify return code: 0" "$SED" "-CAfile $D/ca.pem -tls1_2"
+SRS="--cert $D/rsaserver.pem --key $D/rsaserver.key"
+SP3="--cert $D/p384server.pem --key $D/p384server.key"
+mtls_server "server 1.3 RSA cert"      "Verify return code: 0" "$SRS" "-CAfile $D/rsaroot.pem -tls1_3"
+mtls_server "server 1.3 RSA-PSS sig"   "Peer signature type: rsa_pss_rsae_sha256" "$SRS" "-CAfile $D/rsaroot.pem -tls1_3"
+mtls_server "server 1.2 ECDHE-RSA-AES256" "Cipher is ECDHE-RSA-AES256-GCM-SHA384" "$SRS" "-CAfile $D/rsaroot.pem -tls1_2 -cipher ECDHE-RSA-AES256-GCM-SHA384"
+mtls_server "server 1.2 RSA PKCS#1 sig" "Peer signature type: rsa_pkcs1_sha256" "$SRS" "-CAfile $D/rsaroot.pem -tls1_2 -sigalgs RSA+SHA256"
+mtls_server "server 1.3 P-384 cert"    "Verify return code: 0" "$SP3" "-CAfile $D/p384root.pem -tls1_3"
+mtls_server "server 1.3 P-384 share"   "Peer Temp Key: ECDH, secp384r1" "$SP3" "-CAfile $D/p384root.pem -tls1_3 -groups P-384"
 mtls_server "server 1.2 client cert"   "client cert yes" "$SEC --ca $D/ca.pem --require-client" "-CAfile $D/ecroot.pem -tls1_2 -cert $D/client.pem -key $D/client.key"
 
 # Resumption needs two connections and a saved session.

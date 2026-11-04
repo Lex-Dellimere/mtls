@@ -1,5 +1,5 @@
-// Key exchange for the handshake: X25519 (RFC 7748) and P-256 (SEC 1,
-// uncompressed points). P-384 is added when cryptex has its ECDH.
+// Key exchange for the handshake: X25519 (RFC 7748), P-256 and P-384
+// (SEC 1, uncompressed points).
 // Group numbers are the TLS NamedGroup values.
 
 import "std/mem";
@@ -8,6 +8,7 @@ import "crypto/core/status";
 import "crypto/core/util";
 import "crypto/ecc/kx";
 import "crypto/ecc/p256";
+import "crypto/ecc/p384";
 import "mtls/core/err";
 
 export const MTLS_GROUP_SECP256R1: int32 = 23;
@@ -22,7 +23,7 @@ export struct MtlsKx {
 }
 
 export fn mtls_kx_supported(group: int32) -> bool {
-  return group == MTLS_GROUP_X25519 || group == MTLS_GROUP_SECP256R1;
+  return group == MTLS_GROUP_X25519 || group == MTLS_GROUP_SECP256R1 || group == MTLS_GROUP_SECP384R1;
 }
 
 /// mtls_kx_new: makes a fresh key pair; kx->pk holds the public share.
@@ -35,6 +36,14 @@ export fn mtls_kx_new(kx: MtlsKx*, group: int32) -> int32 {
     memcpy(&kx->sk[0], &psk.b[0], 32);
     cr_wipe(&psk.b[0], 32);
     kx->pklen = 65;
+    return MTLS_OK;
+  }
+  if (group == MTLS_GROUP_SECP384R1) {
+    var qsk: CrP384Secret;
+    if (cr_p384_keypair(&kx->pk[0], 97, &qsk) != CR_OK) { return MTLS_E_CRYPTO; }
+    memcpy(&kx->sk[0], &qsk.b[0], 48);
+    cr_wipe(&qsk.b[0], 48);
+    kx->pklen = 97;
     return MTLS_OK;
   }
   if (group != MTLS_GROUP_X25519) { return MTLS_E_UNSUPPORTED; }
@@ -64,6 +73,16 @@ export fn mtls_kx_shared(kx: MtlsKx*, peer: uint8*, plen: int64, out: uint8*, ol
     memcpy(out, &k.b[0], 32);
     cr_wipe(&k.b[0], 32);
     *olen = 32;
+    return MTLS_OK;
+  }
+  if (kx->group == MTLS_GROUP_SECP384R1) {
+    if (plen != 97) { return MTLS_E_DECODE; }
+    var qsk: CrP384Secret;
+    memcpy(&qsk.b[0], &kx->sk[0], 48);
+    var qrc: int32 = cr_p384_ecdh(out, 48, &qsk, peer, plen);
+    cr_wipe(&qsk.b[0], 48);
+    if (qrc != CR_OK) { return MTLS_E_CRYPTO; }
+    *olen = 48;
     return MTLS_OK;
   }
   if (kx->group != MTLS_GROUP_X25519) { return MTLS_E_UNSUPPORTED; }

@@ -30,3 +30,16 @@ printf "subjectAltName=DNS:server.test,DNS:*.server.test\nextendedKeyUsage=serve
 openssl x509 -req -in ecserver.csr -CA ecinter.pem -CAkey ecinter.key -CAcreateserial -days 36500 -extfile ecserver.ext -out ecserver.pem
 cat ecserver.pem ecinter.pem > ecserver-chain.pem
 rm -f *.csr *.ext *.srl ecinter.key ecroot.key
+
+# RSA-2048 root -> server, and P-384 root -> server.
+for kind in rsa p384; do
+  if [ $kind = rsa ]; then gen="openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048"; else gen="openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384"; fi
+  $gen -out ${kind}root.key
+  openssl req -x509 -new -key ${kind}root.key -subj "/CN=mtls test $kind root" -days 36500 \
+    -addext "basicConstraints=critical,CA:true" -addext "keyUsage=critical,keyCertSign" -out ${kind}root.pem
+  $gen -out ${kind}server.key
+  openssl req -new -key ${kind}server.key -subj "/CN=server.test" -out ${kind}server.csr
+  printf "subjectAltName=DNS:server.test\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:false\n" > ${kind}server.ext
+  openssl x509 -req -in ${kind}server.csr -CA ${kind}root.pem -CAkey ${kind}root.key -CAcreateserial -days 36500 -extfile ${kind}server.ext -out ${kind}server.pem
+  rm -f ${kind}server.csr ${kind}server.ext ${kind}root.srl ${kind}root.key
+done

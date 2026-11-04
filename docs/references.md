@@ -32,8 +32,8 @@ No code was copied; these are designs and limits, re-done in Mettle.
 | Go crypto/tls and crypto/x509 (BSD-3-Clause) | Config shape (`min_version`, `max_version`, ALPN list, client auth levels, roots, pinning instead of a skip-verify callback). The `cryptobyte` pattern: a reader and writer with a sticky error and length prefixes that are opened and closed (core/bytes.mettle). Requiring a server name unless checks are off. |
 | BoringSSL (ISC / OpenSSL) | Hardening limits: at most 32 empty records in a row, one ChangeCipherSpec in a TLS 1.3 handshake, keys must change on a record boundary, a bound on PSK ticket age skew (mtls allows 10 seconds), enforcing the downgrade sentinel. |
 | s2n-tls (Apache-2.0) | Strict extension rules: a ServerHello or EncryptedExtensions may not carry an extension the client did not offer, duplicates are fatal, `pre_shared_key` must be last. |
-| BearSSL (MIT) | Constant-time primitives (cryptex ports `aes_ct64`, `ghash_ctmul64`, `ec_p256_m31`, `rsa_i31`, `ecdsa_i31`); bounded buffers sized for the largest record. |
-| OpenSSL 3 (Apache-2.0) | The interop reference: `mbuild interop` runs 32 cases against `openssl s_server` and `s_client`. |
+| BearSSL (MIT) | Constant-time primitives (cryptex ports `aes_ct64`, `ghash_ctmul64`, `ec_p256_m31`, `ec_prime_i31`, `rsa_i31`, `ecdsa_i31`); bounded buffers sized for the largest record. |
+| OpenSSL 3 (Apache-2.0) | The interop reference: `mbuild interop` runs 43 cases against `openssl s_server` and `s_client`. |
 
 ## Choices worth knowing
 
@@ -55,8 +55,11 @@ No code was copied; these are designs and limits, re-done in Mettle.
 - Known-answer tests: RFC 4231 (HMAC), RFC 5869 (HKDF), RFC 8448 (TLS 1.3
   key schedule).
 - Interop: OpenSSL 3.5 in both directions, both versions, every suite,
-  HelloRetryRequest, ALPN, resumption, mutual TLS, refused certificates.
-- Real servers: full validation against the system trust store.
+  Ed25519, P-256, P-384 and RSA certificates, HelloRetryRequest, ALPN,
+  resumption, mutual TLS, refused certificates.
+- Real servers: Google, GitHub, Amazon, Apple, Microsoft, Cloudflare,
+  Wikipedia, Let's Encrypt, Mozilla, Reddit and others, over TLS 1.3 and
+  TLS 1.2, with full validation against the system trust store.
 - Fuzzing: damaged handshakes, random records, and damaged certificates
   and keys (`mbuild fuzz`), checked in a bounds-checked debug build.
 - Not yet run: BoringSSL's BoGo suite and tlsfuzzer. Both need a test shim

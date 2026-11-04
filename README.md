@@ -11,8 +11,8 @@ Crypto comes from [cryptex](https://github.com/Lex-Dellimere/Cryptex).
 - **Standards and design sources:** [docs/references.md](docs/references.md)
 - **Speed:** [docs/performance.md](docs/performance.md)
 
-> **Not audited yet.** mtls passes 32 interop cases against OpenSSL in both
-> directions and survives long fuzz runs, but no outside party has reviewed
+> **Not audited yet.** mtls passes 43 interop cases against OpenSSL in both
+> directions, connects to major sites with full validation, and survives long fuzz runs, but no outside party has reviewed
 > it. Keep that in mind before you protect high-value data with it.
 
 ## What it supports
@@ -22,21 +22,18 @@ Crypto comes from [cryptex](https://github.com/Lex-Dellimere/Cryptex).
 | Versions | TLS 1.3 (RFC 8446), TLS 1.2 (RFC 5246) |
 | TLS 1.3 suites | TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256 |
 | TLS 1.2 suites | ECDHE with AES-GCM or ChaCha20-Poly1305, ECDSA/Ed25519 or RSA certificates |
-| Key exchange | X25519, P-256 (HelloRetryRequest when the peer prefers another group) |
-| Certificates | Ed25519, ECDSA P-256, RSA 2048-4096 (PKCS#1 v1.5 and PSS); P-384 when cryptex adds it |
+| Key exchange | X25519, P-256, P-384 (HelloRetryRequest when the peer prefers another group) |
+| Certificates | Ed25519, ECDSA P-256 and P-384, RSA 2048-4096 (PKCS#1 v1.5 and PSS), for our own keys and the peer's |
 | Extensions | SNI (RFC 6066), ALPN (RFC 7301), extended master secret (RFC 7627), secure renegotiation (RFC 5746, renegotiation itself is refused), session tickets (RFC 5077, RFC 8446) |
 | Checks | full chain validation (RFC 5280), host names (RFC 6125), pinning, system trust store on Linux and Windows |
 | Not included | 0-RTT early data, renegotiation, TLS 1.1 and older, RSA key exchange, CBC suites, compression |
-
-Our own signing keys: Ed25519 and ECDSA P-256. RSA server keys need RSA
-signing in cryptex, which is on its way.
 
 ## Requirements
 
 - Linux x86-64 (Windows, macOS and ARM64 Linux cross-compile).
 - The Mettle compiler and mbuild.
 - [Cryptex](https://github.com/Lex-Dellimere/Cryptex) checked out next to
-  mtls (`../cryptex`), at a version with P-256, RSA and AES-GCM.
+  mtls (`../cryptex`), at a version with P-256, P-384, RSA and AES-GCM.
 - OpenSSL 3, only for `mbuild interop`.
 
 ## Install
@@ -112,7 +109,7 @@ See [docs/nonblocking.md](docs/nonblocking.md).
 ```bash
 mbuild test          # unit, loopback and fuzz tests, debug build
 mbuild test -r       # the same, release build
-mbuild interop       # 32 cases against openssl s_server and s_client
+mbuild interop       # 43 cases against openssl s_server and s_client
 mbuild fuzz 100000   # long fuzz run of the handshake and X.509 parsers
 ```
 

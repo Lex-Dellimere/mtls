@@ -2,6 +2,8 @@
 // real certificate checks, application data both ways, key update,
 // exporters, resumption, mutual TLS, HelloRetryRequest, and the failures
 // a wrong name, an unknown CA, a wrong pin or a missing client cert cause.
+// Server certificates: Ed25519, ECDSA P-256 (with an intermediate), RSA-2048
+// and ECDSA P-384.
 
 import "std/io";
 import "std/mem";
@@ -242,6 +244,24 @@ fn edge_cases() -> int32 {
   if (echo_check(c, s) != 0) { return 13; }
   mtls_conn_free(c);
   mtls_conn_free(s);
+  // P-384 key exchange, both versions.
+  ccfg.groups[0] = MTLS_GROUP_SECP384R1;
+  ccfg.ngroups = 1;
+  scfg.groups[0] = MTLS_GROUP_SECP384R1;
+  if (handshake(&ccfg, &scfg, &c, &s) != 0) { return 16; }
+  if (c->group != MTLS_GROUP_SECP384R1 || echo_check(c, s) != 0) { return 17; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  ccfg.max_version = MTLS_TLS12;
+  if (handshake(&ccfg, &scfg, &c, &s) != 0) { return 18; }
+  if (c->group != MTLS_GROUP_SECP384R1) { return 19; }
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+  ccfg.max_version = MTLS_TLS13;
+  ccfg.groups[0] = MTLS_GROUP_X25519;
+  ccfg.groups[1] = MTLS_GROUP_SECP256R1;
+  ccfg.ngroups = 2;
+  scfg.groups[0] = MTLS_GROUP_SECP256R1;
   // TLS 1.2 with P-256 ECDHE.
   ccfg.max_version = MTLS_TLS12;
   if (handshake(&ccfg, &scfg, &c, &s) != 0) { return 14; }
@@ -269,6 +289,20 @@ fn main() -> int32 {
   if (rc != 0) { println("TLS 1.3 P-256 failed at {rc}"); return 3; }
   rc = scenario(MTLS_TLS12, 0xc02b, ec_chain, ec_key, ec_root);
   if (rc != 0) { println("TLS 1.2 P-256 failed at {rc}"); return 4; }
+  var rsa_chain: string = import_str "data/tls/rsaserver.pem";
+  var rsa_key: string = import_str "data/tls/rsaserver.key";
+  var rsa_root: string = import_str "data/tls/rsaroot.pem";
+  var p384_chain: string = import_str "data/tls/p384server.pem";
+  var p384_key: string = import_str "data/tls/p384server.key";
+  var p384_root: string = import_str "data/tls/p384root.pem";
+  rc = scenario(MTLS_TLS13, 0x1301, rsa_chain, rsa_key, rsa_root);
+  if (rc != 0) { println("TLS 1.3 RSA failed at {rc}"); return 6; }
+  rc = scenario(MTLS_TLS12, 0xc02f, rsa_chain, rsa_key, rsa_root);
+  if (rc != 0) { println("TLS 1.2 RSA failed at {rc}"); return 7; }
+  rc = scenario(MTLS_TLS13, 0x1301, p384_chain, p384_key, p384_root);
+  if (rc != 0) { println("TLS 1.3 P-384 failed at {rc}"); return 8; }
+  rc = scenario(MTLS_TLS12, 0xc02b, p384_chain, p384_key, p384_root);
+  if (rc != 0) { println("TLS 1.2 P-384 failed at {rc}"); return 9; }
   rc = edge_cases();
   if (rc != 0) { println("edge cases failed at {rc}"); return 5; }
   println("loopback ok");

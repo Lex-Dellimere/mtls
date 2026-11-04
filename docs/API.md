@@ -10,10 +10,10 @@ One config can serve many connections. Do not change it while they run.
 
 | Call / field | Meaning |
 |---|---|
-| `mtls_config_init(&cfg)` | Defaults: TLS 1.2 and 1.3, every supported suite, X25519 then P-256, full certificate checks, tickets on |
+| `mtls_config_init(&cfg)` | Defaults: TLS 1.2 and 1.3, every supported suite, X25519 then P-256 then P-384, full certificate checks, tickets on |
 | `cfg.min_version`, `cfg.max_version` | `MTLS_TLS12`, `MTLS_TLS13` |
 | `mtls_config_set_suites(&cfg, ids, n)` | Restrict suites, in order of preference (IANA numbers, e.g. `0x1301`) |
-| `cfg.groups[]`, `cfg.ngroups` | Key exchange groups in order: `MTLS_GROUP_X25519`, `MTLS_GROUP_SECP256R1` |
+| `cfg.groups[]`, `cfg.ngroups` | Key exchange groups in order: `MTLS_GROUP_X25519`, `MTLS_GROUP_SECP256R1`, `MTLS_GROUP_SECP384R1` |
 | `mtls_config_add_alpn(&cfg, "h2")` | Offer (client) or accept (server) a protocol; order is preference |
 | `cfg.roots` | `MtlsRoots*` to check the peer against (servers: client certificates) |
 | `cfg.verify_mode` | `MTLS_VERIFY_FULL` (default), `MTLS_VERIFY_PIN` (only `cfg.pin`, the SHA-256 of the leaf's SubjectPublicKeyInfo), `MTLS_VERIFY_NONE` (tests only) |
