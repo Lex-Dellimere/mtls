@@ -12,8 +12,9 @@ Crypto comes from [cryptex](https://github.com/Lex-Dellimere/Cryptex).
 - **Speed:** [docs/performance.md](docs/performance.md)
 
 > **Not audited yet.** mtls passes 43 interop cases against OpenSSL in both
-> directions, connects to major sites with full validation, and survives long fuzz runs, but no outside party has reviewed
-> it. Keep that in mind before you protect high-value data with it.
+> directions, connects to major sites with full validation, and survives
+> long fuzz runs, but no outside party has reviewed it. Keep that in mind
+> before you protect high-value data with it.
 
 ## What it supports
 
