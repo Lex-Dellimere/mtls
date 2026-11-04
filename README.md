@@ -4,7 +4,7 @@ TLS 1.3 and TLS 1.2 for Mettle, written in pure Mettle.
 
 Client and server, X.509 certificate validation, mutual TLS, ALPN, SNI,
 session resumption, key update, and both blocking and non-blocking I/O.
-Crypto comes from [cryptex](https://github.com/Lex-Dellimere/cryptex).
+Crypto comes from [cryptex](https://github.com/Lex-Dellimere/Cryptex).
 
 - **API reference:** [docs/API.md](docs/API.md)
 - **Event loops (alph, epoll):** [docs/nonblocking.md](docs/nonblocking.md)
@@ -35,6 +35,8 @@ signing in cryptex, which is on its way.
 
 - Linux x86-64 (Windows, macOS and ARM64 Linux cross-compile).
 - The Mettle compiler and mbuild.
+- [Cryptex](https://github.com/Lex-Dellimere/Cryptex) checked out next to
+  mtls (`../cryptex`), at a version with P-256, RSA and AES-GCM.
 - OpenSSL 3, only for `mbuild interop`.
 
 ## Install
