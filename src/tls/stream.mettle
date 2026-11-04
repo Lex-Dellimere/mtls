@@ -21,6 +21,10 @@ export struct MtlsStream {
   fd: int64;
   c: MtlsConn*;
   owns_fd: bool;
+  // Why mtls_dial failed, kept after the connection is freed.
+  cert_error: int32;      // MTLS_CV_*
+  alert_sent: int32;
+  alert_received: int32;
 }
 
 /// mtls_stream_flush: sends everything queued. Waits on a non-blocking
@@ -147,9 +151,16 @@ export fn mtls_stream_close(s: MtlsStream*) {
   }
 }
 
-/// mtls_dial: connects to host:port and runs the client handshake. The
-/// stream owns the socket. On failure *err holds the MTLS_E_* code.
+/// mtls_dial: connects to host:port and runs the client handshake, with
+/// host as the server name. The stream owns the socket. On failure the
+/// stream's cert_error and alert fields say why.
 export fn mtls_dial(s: MtlsStream*, host: string, port: int32, cfg: MtlsConfig*, timeout_ms: int64) -> int32 {
+  return mtls_dial_name(s, host, port, host, cfg, timeout_ms);
+}
+
+/// mtls_dial_name: mtls_dial to an address (a name or an IP literal) that
+/// differs from the server name used for SNI and the certificate check.
+export fn mtls_dial_name(s: MtlsStream*, host: string, port: int32, server_name: string, cfg: MtlsConfig*, timeout_ms: int64) -> int32 {
   memset(s, 0, (int64)sizeof(MtlsStream));
   s->fd = -1;
   match (tcp_connect(host, port, timeout_ms)) {
@@ -162,9 +173,14 @@ export fn mtls_dial(s: MtlsStream*, host: string, port: int32, cfg: MtlsConfig*,
   }
   if (timeout_ms > 0) { sock_set_timeout(s->fd, timeout_ms, timeout_ms); }
   var fd: int64 = s->fd;
-  var rc: int32 = mtls_stream_client(s, fd, cfg, host);
+  var rc: int32 = mtls_stream_client(s, fd, cfg, server_name);
   s->owns_fd = true;
   if (rc != MTLS_OK) {
+    if (s->c != 0) {
+      s->cert_error = mtls_conn_cert_error(s->c);
+      s->alert_sent = mtls_conn_alert_sent(s->c);
+      s->alert_received = mtls_conn_alert_received(s->c);
+    }
     mtls_stream_close(s);
     return rc;
   }

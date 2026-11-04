@@ -7,8 +7,6 @@ import "std/io";
 import "std/mem";
 import "std/env";
 import "std/conv";
-import "crypto/core/types";
-import "crypto/ecc/sign";
 import "mtls/mtls";
 
 var g_seed: uint64 = 0x9e3779b97f4a7c15;
@@ -23,17 +21,6 @@ fn rnd() -> uint64 {
 fn rnd_below(n: int64) -> int64 {
   if (n <= 0) { return 0; }
   return (int64)(rnd() % (uint64)n);
-}
-
-fn load_key(der: string, k: MtlsPrivKey*) {
-  memset(k, 0, (int64)sizeof(MtlsPrivKey));
-  var pk: CrEd25519Public;
-  var sk: CrEd25519Secret;
-  var seed: CrSeed32;
-  memcpy(&seed.b[0], der.chars + (int64)der.length - 32, 32);
-  cr_ed25519_seed_keypair(&pk, &sk, &seed);
-  k->kind = MTLS_KEY_ED25519;
-  memcpy(&k->sk[0], &sk.b[0], 64);
 }
 
 var g_c2s: uint8[65536];
@@ -100,16 +87,11 @@ fn feed_chunks(c: MtlsConn*, p: uint8*, n: int64) {
 }
 
 fn main() -> int32 {
-  var cert_der: string = import_str "data/tls/server.der";
-  var key_der: string = import_str "data/tls/server.key.der";
+  var chain: string = import_str "data/tls/server.pem";
+  var key: string = import_str "data/tls/server.key";
   var scfg: MtlsConfig;
   mtls_config_init(&scfg);
-  var key: MtlsPrivKey;
-  load_key(key_der, &key);
-  var chain: MtlsDer[1];
-  chain[0].p = cert_der.chars;
-  chain[0].n = (int64)cert_der.length;
-  mtls_config_set_cert(&scfg, &chain[0], 1, &key);
+  if (mtls_config_set_cert_pem(&scfg, chain.chars, (int64)chain.length, key.chars, (int64)key.length) != MTLS_OK) { return 2; }
   mtls_config_add_alpn(&scfg, "h2");
   scfg.client_auth = MTLS_CLIENT_AUTH_REQUEST;
   var ccfg: MtlsConfig;

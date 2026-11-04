@@ -1,0 +1,188 @@
+// mtls-client: connects to a TLS server, prints what was negotiated, and
+// optionally fetches a page or sends a line. A small s_client for tests
+// and for poking at servers.
+//
+//   mtls-client [options] HOST [PORT]
+//     --ca FILE        trust the roots in FILE instead of the system store
+//     --insecure       skip certificate checks (testing only)
+//     --pin HEX        accept only this SHA-256 of the server's public key
+//     --cert FILE --key FILE   client certificate for mutual TLS
+//     --alpn PROTO     offer a protocol (repeatable)
+//     --tls12 | --tls13        only that version
+//     --groups LIST    x25519, p256 (comma separated, in order)
+//     --get PATH       send an HTTP/1.1 GET and print the response
+//     --send TEXT      send TEXT, print the reply until the server closes
+//     --resume N       connect N more times, resuming the first session
+//     --servername N   name for SNI and the certificate check (default HOST)
+
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/socket";
+import "mtls/mtls";
+
+fn usage() -> int32 {
+  println("usage: mtls-client [--ca FILE] [--insecure] [--pin HEX] [--cert FILE --key FILE] [--alpn P] [--tls12|--tls13] [--groups LIST] [--get PATH | --send TEXT] [--resume N] [--servername NAME] HOST [PORT]");
+  return 2;
+}
+
+fn hexval(c: int32) -> int32 {
+  if (c >= 48 && c <= 57) { return c - 48; }
+  if (c >= 97 && c <= 102) { return c - 87; }
+  if (c >= 65 && c <= 70) { return c - 55; }
+  return -1;
+}
+
+fn parse_groups(cfg: MtlsConfig*, list: string) -> bool {
+  cfg->ngroups = 0;
+  var i: int64 = 0;
+  var n: int64 = (int64)list.length;
+  while (i < n) {
+    var j: int64 = i;
+    while (j < n && (int32)list[j] != 44) { j = j + 1; }
+    var name: string = str_slice(list, i, j - i);
+    var g: int32 = 0;
+    if (name == "x25519") { g = MTLS_GROUP_X25519; }
+    if (name == "p256") { g = MTLS_GROUP_SECP256R1; }
+    if (g == 0 || !mtls_kx_supported(g) || cfg->ngroups >= 4) { return false; }
+    cfg->groups[cfg->ngroups] = g;
+    cfg->ngroups = cfg->ngroups + 1;
+    i = j + 1;
+  }
+  return cfg->ngroups > 0;
+}
+
+fn version_name(v: int32) -> string {
+  if (v == MTLS_TLS13) { return "TLS 1.3"; }
+  return "TLS 1.2";
+}
+
+fn yes(b: bool) -> string {
+  if (b) { return "yes"; }
+  return "no";
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var cfg: MtlsConfig;
+  mtls_config_init(&cfg);
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  var ca: string = "";
+  var certf: string = "";
+  var keyf: string = "";
+  var get: string = "";
+  var send: string = "";
+  var host: string = "";
+  var sname: string = "";
+  var port: int32 = 443;
+  var resume: int64 = 0;
+  var npos: int32 = 0;
+  var i: int32 = 1;
+  while (i < argc) {
+    var a: string = str_from_cstr(argv[i]);
+    var next: string = "";
+    if (i + 1 < argc) { next = str_from_cstr(argv[i + 1]); }
+    if (a == "--ca") { ca = next; i = i + 1; }
+    else if (a == "--insecure") { cfg.verify_mode = MTLS_VERIFY_NONE; }
+    else if (a == "--pin") {
+      if (next.length != 64) { return usage(); }
+      for k in 0..32 {
+        var hi: int32 = hexval((int32)next[k * 2]);
+        var lo: int32 = hexval((int32)next[k * 2 + 1]);
+        if (hi < 0 || lo < 0) { return usage(); }
+        cfg.pin[k] = (uint8)(hi * 16 + lo);
+      }
+      cfg.verify_mode = MTLS_VERIFY_PIN;
+      i = i + 1;
+    }
+    else if (a == "--cert") { certf = next; i = i + 1; }
+    else if (a == "--key") { keyf = next; i = i + 1; }
+    else if (a == "--alpn") { mtls_config_add_alpn(&cfg, next); i = i + 1; }
+    else if (a == "--tls12") { cfg.max_version = MTLS_TLS12; }
+    else if (a == "--tls13") { cfg.min_version = MTLS_TLS13; }
+    else if (a == "--groups") {
+      if (!parse_groups(&cfg, next)) { return usage(); }
+      i = i + 1;
+    }
+    else if (a == "--get") { get = next; i = i + 1; }
+    else if (a == "--send") { send = next; i = i + 1; }
+    else if (a == "--servername") { sname = next; i = i + 1; }
+    else if (a == "--resume") { resume = str_to_i64_or(next, 0); i = i + 1; }
+    else if (npos == 0) { host = a; npos = 1; }
+    else if (npos == 1) { port = (int32)str_to_i64_or(a, -1); npos = 2; }
+    else { return usage(); }
+    i = i + 1;
+  }
+  if (host.length == 0 || port <= 0 || port > 65535) { return usage(); }
+  if (cfg.verify_mode == MTLS_VERIFY_FULL) {
+    var rc: int32 = MTLS_OK;
+    if (ca.length > 0) {
+      rc = mtls_roots_add_file(&roots, ca);
+    } else {
+      rc = mtls_roots_load_system(&roots);
+    }
+    if (rc < 0 || roots.count == 0) {
+      println("error: no trusted roots loaded ({mtls_err_text(rc)})");
+      return 1;
+    }
+    cfg.roots = &roots;
+  }
+  if (certf.length > 0) {
+    var rc2: int32 = mtls_config_load_cert_files(&cfg, certf, keyf);
+    if (rc2 != MTLS_OK) {
+      println("error: cannot load {certf} / {keyf}: {mtls_err_text(rc2)}");
+      return 1;
+    }
+  }
+  var cache: MtlsSessionCache* = mtls_cache_new();
+  cfg.cache = cache;
+  var status: int32 = 0;
+  for round in 0..(resume + 1) {
+    var s: MtlsStream;
+    var rc3: int32 = MTLS_OK;
+    if (sname.length == 0) {
+      rc3 = mtls_dial(&s, host, port, &cfg, 10000);
+    } else {
+      rc3 = mtls_dial_name(&s, host, port, sname, &cfg, 10000);
+    }
+    if (rc3 != MTLS_OK) {
+      println("error: {mtls_err_text(rc3)}");
+      if (s.cert_error != 0) { println("  certificate: {mtls_cv_text(s.cert_error)}"); }
+      if (s.alert_sent >= 0) { println("  sent alert: {mtls_alert_text(s.alert_sent)}"); }
+      if (s.alert_received >= 0) { println("  peer sent alert: {mtls_alert_text(s.alert_received)}"); }
+      return 1;
+    }
+    var c: MtlsConn* = s.c;
+    println("connected: {version_name(mtls_conn_version(c))}, {mtls_suite_name(mtls_conn_suite(c))}, alpn '{mtls_conn_alpn(c)}', verified {yes(mtls_conn_peer_verified(c))}, resumed {yes(mtls_conn_resumed(c))}");
+    var req: string = send;
+    if (get.length > 0) {
+      req = "GET " + get + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nUser-Agent: mtls-client\r\n\r\n";
+    }
+    if (req.length > 0) {
+      if (mtls_stream_write_str(&s, req) < 0) { status = 1; }
+      var buf: uint8[16384];
+      while (true) {
+        var n: int64 = mtls_stream_read(&s, &buf[0], 16384);
+        if (n <= 0) {
+          if (n < 0 && n != (int64)MTLS_E_EOF) {
+            println("");
+            println("error: {mtls_err_text((int32)n)}");
+            status = 1;
+          }
+          break;
+        }
+        if (round == resume) { print(str_from_bytes((cstring)&buf[0], n)); }
+      }
+    } else {
+      // Read once briefly so a TLS 1.3 server's tickets arrive.
+      sock_set_timeout(s.fd, 300, 300);
+      var tb: uint8[512];
+      mtls_stream_read(&s, &tb[0], 512);
+    }
+    mtls_stream_close(&s);
+  }
+  mtls_cache_free(cache);
+  mtls_config_free(&cfg);
+  mtls_roots_free(&roots);
+  return status;
+}

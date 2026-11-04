@@ -14,3 +14,18 @@ fn project() {
 fn deps() {
   mb_dep_path("crypto", "../cryptex");
 }
+
+// interop: builds the release tools and runs tests/interop.sh, which needs
+// `openssl` on the PATH (OpenSSL 3).
+fn cmd_interop(a: MbArgs*) -> int32 {
+  if (mb_mbuild("build -r") != 0) { return 1; }
+  return mb_sh("sh tests/interop.sh build/" + mb_os() + "/release");
+}
+
+// fuzz: a long fuzz run in release (MTLS_FUZZ_ROUNDS, default 20000).
+fn cmd_fuzz(a: MbArgs*) -> int32 {
+  var rounds: string = "20000";
+  if (mb_nargs(a) > 0) { rounds = mb_arg(a, 0); }
+  if (mb_mbuild("test -r fuzz") != 0) { return 1; }
+  return mb_sh("MTLS_FUZZ_ROUNDS=" + rounds + " .mbuild/test-bins/" + mb_os() + "/release/fuzz && MTLS_FUZZ_ROUNDS=" + rounds + " .mbuild/test-bins/" + mb_os() + "/release/x509_fuzz");
+}
