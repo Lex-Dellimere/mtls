@@ -1,0 +1,10 @@
+import "mbuild/api";
+
+// A TLS echo server with optional client certificates.
+fn project() {
+  mb_package("mtls_echo_server", "0.1.0");
+}
+
+fn deps() {
+  mb_dep_path("mtls", "../..");
+}

@@ -1,0 +1,47 @@
+// Fetches https://HOST/PATH and prints the response.
+//
+//   mbuild run -- www.example.org /
+
+import "std/io";
+import "std/conv";
+import "mtls/mtls";
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 2) {
+    println("usage: https_get HOST [PATH]");
+    return 2;
+  }
+  var host: string = str_from_cstr(argv[1]);
+  var path: string = "/";
+  if (argc > 2) { path = str_from_cstr(argv[2]); }
+
+  // Trust what the operating system trusts.
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  if (mtls_roots_load_system(&roots) <= 0) {
+    println("no system trust store found");
+    return 1;
+  }
+  var cfg: MtlsConfig;
+  mtls_config_init(&cfg);
+  cfg.roots = &roots;
+  mtls_config_add_alpn(&cfg, "http/1.1");
+
+  var s: MtlsStream;
+  var rc: int32 = mtls_dial(&s, host, 443, &cfg, 10000);
+  if (rc != MTLS_OK) {
+    println("connect failed: {mtls_err_text(rc)}");
+    if (s.cert_error != 0) { println("certificate: {mtls_cv_text(s.cert_error)}"); }
+    return 1;
+  }
+  mtls_stream_write_str(&s, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+  var buf: uint8[16384];
+  while (true) {
+    var n: int64 = mtls_stream_read(&s, &buf[0], 16384);
+    if (n <= 0) { break; }
+    print(str_from_bytes((cstring)&buf[0], n));
+  }
+  mtls_stream_close(&s);
+  mtls_roots_free(&roots);
+  return 0;
+}

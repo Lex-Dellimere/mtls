@@ -1,0 +1,112 @@
+// mtls-bench: handshakes per second and bulk throughput, client and
+// server in one process (no sockets), so the numbers are mtls and cryptex
+// alone. Build with `mbuild build -r` for meaningful numbers.
+
+import "std/io";
+import "std/mem";
+import "std/time";
+import "mtls/mtls";
+
+var g_buf: uint8[262144];
+
+fn pump(a: MtlsConn*, b: MtlsConn*) {
+  for round in 0..100 {
+    var moved: bool = false;
+    var n: int64 = mtls_conn_take_out(a, &g_buf[0], 262144);
+    if (n > 0) { moved = true; mtls_conn_feed(b, &g_buf[0], n); }
+    n = mtls_conn_take_out(b, &g_buf[0], 262144);
+    if (n > 0) { moved = true; mtls_conn_feed(a, &g_buf[0], n); }
+    if (!moved) { return; }
+  }
+}
+
+fn connect(ccfg: MtlsConfig*, scfg: MtlsConfig*, cp: MtlsConn**, sp: MtlsConn**) -> bool {
+  var c: MtlsConn* = mtls_client_new(ccfg);
+  var s: MtlsConn* = mtls_server_new(scfg);
+  mtls_client_start(c, "server.test");
+  pump(c, s);
+  *cp = c;
+  *sp = s;
+  return !mtls_conn_handshaking(c) && mtls_conn_error(c) == 0 && mtls_conn_error(s) == 0;
+}
+
+fn handshakes(label: string, ccfg: MtlsConfig*, scfg: MtlsConfig*) {
+  var n: int32 = 0;
+  var t0: int64 = time_mono_ns();
+  while (time_mono_ns() - t0 < 1000000000) {
+    var c: MtlsConn* = (MtlsConn*)0;
+    var s: MtlsConn* = (MtlsConn*)0;
+    if (!connect(ccfg, scfg, &c, &s)) {
+      println("{label}: handshake failed");
+      return;
+    }
+    mtls_conn_free(c);
+    mtls_conn_free(s);
+    n = n + 1;
+  }
+  var secs: float64 = (float64)(time_mono_ns() - t0) / 1000000000.0;
+  println("{label}: {(float64)n / secs} handshakes/s (client + server)");
+}
+
+fn bulk(label: string, ccfg: MtlsConfig*, scfg: MtlsConfig*) {
+  var c: MtlsConn* = (MtlsConn*)0;
+  var s: MtlsConn* = (MtlsConn*)0;
+  if (!connect(ccfg, scfg, &c, &s)) {
+    println("{label}: handshake failed");
+    return;
+  }
+  var data: uint8[16384];
+  var sink: uint8[16384];
+  memset(&data[0], 7, 16384);
+  var total: int64 = 0;
+  var t0: int64 = time_mono_ns();
+  while (time_mono_ns() - t0 < 1000000000) {
+    for i in 0..64 {
+      mtls_conn_write(c, &data[0], 16384);
+      var n: int64 = mtls_conn_take_out(c, &g_buf[0], 262144);
+      mtls_conn_feed(s, &g_buf[0], n);
+      while (mtls_conn_read(s, &sink[0], 16384) > 0) { }
+      total = total + 16384;
+    }
+  }
+  var secs: float64 = (float64)(time_mono_ns() - t0) / 1000000000.0;
+  println("{label}: {(float64)total / secs / 1048576.0} MB/s (encrypt + decrypt)");
+  mtls_conn_free(c);
+  mtls_conn_free(s);
+}
+
+fn main() -> int32 {
+  var ed_chain: string = import_str "../../tests/data/tls/server.pem";
+  var ed_key: string = import_str "../../tests/data/tls/server.key";
+  var ec_chain: string = import_str "../../tests/data/tls/ecserver-chain.pem";
+  var ec_key: string = import_str "../../tests/data/tls/ecserver.key";
+  var ed: MtlsConfig;
+  mtls_config_init(&ed);
+  ed.tickets = false;
+  mtls_config_set_cert_pem(&ed, ed_chain.chars, (int64)ed_chain.length, ed_key.chars, (int64)ed_key.length);
+  var ec: MtlsConfig;
+  mtls_config_init(&ec);
+  ec.tickets = false;
+  mtls_config_set_cert_pem(&ec, ec_chain.chars, (int64)ec_chain.length, ec_key.chars, (int64)ec_key.length);
+  var cli: MtlsConfig;
+  mtls_config_init(&cli);
+  cli.verify_mode = MTLS_VERIFY_NONE;
+  cli.tickets = false;
+
+  handshakes("TLS 1.3 X25519 + Ed25519", &cli, &ed);
+  handshakes("TLS 1.3 X25519 + ECDSA P-256", &cli, &ec);
+  cli.groups[0] = MTLS_GROUP_SECP256R1;
+  cli.ngroups = 1;
+  handshakes("TLS 1.3 P-256 + ECDSA P-256", &cli, &ec);
+  cli.groups[0] = MTLS_GROUP_X25519;
+  cli.max_version = MTLS_TLS12;
+  handshakes("TLS 1.2 X25519 + Ed25519", &cli, &ed);
+  cli.max_version = MTLS_TLS13;
+
+  var ids: int32[3] = [0x1301, 0x1302, 0x1303];
+  for i in 0..3 {
+    mtls_config_set_suites(&cli, &ids[i], 1);
+    bulk(mtls_suite_name(ids[i]), &cli, &ed);
+  }
+  return 0;
+}

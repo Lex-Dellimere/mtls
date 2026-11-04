@@ -1,0 +1,11 @@
+import "mbuild/api";
+
+// A minimal dependent of mtls: fetch a page over HTTPS, checked against
+// the system trust store.
+fn project() {
+  mb_package("mtls_https_get", "0.1.0");
+}
+
+fn deps() {
+  mb_dep_path("mtls", "../..");
+}

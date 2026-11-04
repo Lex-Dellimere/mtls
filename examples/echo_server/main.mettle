@@ -1,0 +1,61 @@
+// A TLS 1.3 echo server on 127.0.0.1:8443. Every line a client sends comes
+// back. With a CA file it requires client certificates (mutual TLS).
+//
+//   mbuild run -- cert.pem key.pem [client-ca.pem]
+//   openssl s_client -connect 127.0.0.1:8443
+
+import "std/io";
+import "std/conv";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "mtls/mtls";
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc < 3) {
+    println("usage: echo_server CERT KEY [CLIENT_CA]");
+    return 2;
+  }
+  var cfg: MtlsConfig;
+  mtls_config_init(&cfg);
+  var rc: int32 = mtls_config_load_cert_files(&cfg, str_from_cstr(argv[1]), str_from_cstr(argv[2]));
+  if (rc != MTLS_OK) {
+    println("cannot load certificate or key: {mtls_err_text(rc)}");
+    return 1;
+  }
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  if (argc > 3) {
+    mtls_roots_add_file(&roots, str_from_cstr(argv[3]));
+    cfg.roots = &roots;
+    cfg.client_auth = MTLS_CLIENT_AUTH_REQUIRE;
+  }
+  var addr: NetAddr = net_addr_v4(127, 0, 0, 1, 8443);
+  var lfd: int64 = -1;
+  match (tcp_listen(&addr, 16)) {
+    case Ok(fd): { lfd = fd; }
+    case Err(e): {
+      println("listen: {e.message}");
+      return 1;
+    }
+  }
+  println("echo server on 127.0.0.1:8443");
+  while (true) {
+    var peer: NetAddr;
+    var fd: int64 = sock_accept(lfd, &peer);
+    if (fd < 0) { continue; }
+    var s: MtlsStream;
+    rc = mtls_stream_server(&s, fd, &cfg);
+    s.owns_fd = true;
+    if (rc == MTLS_OK) {
+      var buf: uint8[4096];
+      while (true) {
+        var n: int64 = mtls_stream_read(&s, &buf[0], 4096);
+        if (n <= 0) { break; }
+        mtls_stream_write(&s, &buf[0], n);
+      }
+    }
+    mtls_stream_close(&s);
+  }
+  return 0;
+}
