@@ -3,7 +3,7 @@
 // while they run.
 
 import "std/mem";
-import "crypto/core/util";
+import "cryptex/core/util";
 import "mtls/core/err";
 import "mtls/crypto/sig";
 import "mtls/crypto/kx";

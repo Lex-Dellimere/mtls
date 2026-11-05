@@ -5,14 +5,14 @@ import "mbuild/api";
 // Layout: src/mtls.mettle is the facade; modules sit in src/<area>/.
 // Tests: tests/<name>_test.mettle, run with `mbuild test` and `mbuild test -r`.
 fn project() {
-  mb_package("mtls", "0.2.0");
+  mb_package("mtls", "0.2.1");
   mb_meta("description", "TLS 1.3 and 1.2 client and server in pure Mettle: X.509 validation, mutual TLS, ALPN, resumption, blocking, thread-shared and non-blocking (alph) I/O");
   mb_meta("license", "Apache-2.0");
   mb_import_root("src");
 }
 
 fn deps() {
-  mb_dep_path("crypto", "../cryptex");
+  mb_dep_path("cryptex", "../cryptex");
 }
 
 // interop: builds the release tools and runs tests/interop.sh, which needs

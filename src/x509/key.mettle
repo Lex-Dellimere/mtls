@@ -8,9 +8,9 @@
 // parts point into it. Temporary copies of key material are wiped.
 
 import "std/mem";
-import "crypto/core/types";
-import "crypto/core/util";
-import "crypto/ecc/sign";
+import "cryptex/core/types";
+import "cryptex/core/util";
+import "cryptex/ecc/sign";
 import "mtls/core/err";
 import "mtls/core/bytes";
 import "mtls/crypto/sig";

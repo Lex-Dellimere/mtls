@@ -3,11 +3,11 @@
 // record number (RFC 8446 5.3), so a key/nonce pair is never reused.
 
 import "std/mem";
-import "crypto/core/types";
-import "crypto/core/status";
-import "crypto/core/util";
-import "crypto/cipher/aead";
-import "crypto/cipher/gcm";
+import "cryptex/core/types";
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/cipher/aead";
+import "cryptex/cipher/gcm";
 import "mtls/core/err";
 
 export const MTLS_AEAD_AES128GCM: int32 = 1;

@@ -3,7 +3,7 @@
 // 4.6.1). Layout: nonce(12) || ChaCha20-Poly1305(state) || tag(16).
 
 import "std/mem";
-import "crypto/core/util";
+import "cryptex/core/util";
 import "mtls/core/err";
 import "mtls/core/bytes";
 import "mtls/crypto/aead";

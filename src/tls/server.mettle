@@ -2,7 +2,7 @@
 // TLS 1.3 handshake (RFC 8446 4). TLS 1.2 goes to server12.
 
 import "std/mem";
-import "crypto/core/util";
+import "cryptex/core/util";
 import "mtls/core/err";
 import "mtls/core/bytes";
 import "mtls/crypto/hash";

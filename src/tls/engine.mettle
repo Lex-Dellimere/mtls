@@ -8,7 +8,7 @@
 
 import "std/mem";
 import "std/sync";
-import "crypto/core/util";
+import "cryptex/core/util";
 import "mtls/core/err";
 import "mtls/core/bytes";
 import "mtls/crypto/hash";

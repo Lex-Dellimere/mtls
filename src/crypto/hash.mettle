@@ -4,8 +4,8 @@
 // them as RFC 2104, 5869, 8446 and 5246 describe.
 
 import "std/mem";
-import "crypto/core/util";
-import "crypto/hash/sha2";
+import "cryptex/core/util";
+import "cryptex/hash/sha2";
 import "mtls/core/err";
 import "mtls/core/bytes";
 

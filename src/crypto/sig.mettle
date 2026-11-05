@@ -3,15 +3,15 @@
 // RSA with PKCS#1 v1.5 or PSS padding, for both signing and verifying.
 
 import "std/mem";
-import "crypto/core/types";
-import "crypto/core/status";
-import "crypto/core/util";
-import "crypto/ecc/sign";
-import "crypto/ecc/p256";
-import "crypto/ecc/p384";
-import "crypto/ecc/ecdsa";
-import "crypto/rsa/rsa";
-import "crypto/hash/hash";
+import "cryptex/core/types";
+import "cryptex/core/status";
+import "cryptex/core/util";
+import "cryptex/ecc/sign";
+import "cryptex/ecc/p256";
+import "cryptex/ecc/p384";
+import "cryptex/ecc/ecdsa";
+import "cryptex/rsa/rsa";
+import "cryptex/hash/hash";
 import "mtls/core/err";
 import "mtls/crypto/hash";
 
