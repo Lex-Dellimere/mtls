@@ -91,8 +91,13 @@ if (mtls_stream_server(&s, accepted_fd, &cfg) == MTLS_OK) {
 }
 ```
 
-For an event loop, use `MtlsConn` directly: it never touches a socket.
-See [docs/nonblocking.md](docs/nonblocking.md).
+For an event loop (alph actors or tasks, epoll), use `MtlsNb`: the
+handshake and all I/O move one readiness event at a time and never block,
+and `mtls_nb_close` is safe to call from an exit hook. `MtlsConn` underneath
+never touches a socket at all. See [docs/nonblocking.md](docs/nonblocking.md).
+
+An `MtlsStream` can be shared by threads after the handshake: one reader
+and any number of writers, with no lock of your own.
 
 ## Tools
 
@@ -110,7 +115,7 @@ See [docs/nonblocking.md](docs/nonblocking.md).
 ```bash
 mbuild test          # unit, loopback and fuzz tests, debug build
 mbuild test -r       # the same, release build
-mbuild interop       # 43 cases against openssl s_server and s_client
+mbuild interop       # 43 cases against openssl, plus the alph example
 mbuild fuzz 100000   # long fuzz run of the handshake and X.509 parsers
 ```
 
@@ -118,6 +123,7 @@ mbuild fuzz 100000   # long fuzz run of the handshake and X.509 parsers
 
 - [examples/https_get](examples/https_get): fetch a page, checked against the system roots.
 - [examples/echo_server](examples/echo_server): TLS echo server, optional client certificates.
+- [examples/alph_echo](examples/alph_echo): TLS server and client as alph actors, non-blocking, with exit-hook cleanup (needs alph next to mtls).
 
 ## Layout
 

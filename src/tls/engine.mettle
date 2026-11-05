@@ -7,6 +7,7 @@
 //   read and write application data with mtls_conn_read / _write.
 
 import "std/mem";
+import "std/sync";
 import "crypto/core/util";
 import "mtls/core/err";
 import "mtls/core/bytes";
@@ -54,12 +55,16 @@ export fn mtls_conn_key_update(c: MtlsConn*, ask_peer: bool) -> int32 {
   m[3] = 1;
   m[4] = 0;
   if (ask_peer) { m[4] = 1; }
-  var rc: int32 = mtls_send_record(c, MTLS_CT_HANDSHAKE, &m[0], 5);
-  if (rc != MTLS_OK) { return rc; }
+  // The message goes out under the old key and every later record under
+  // the new one, so both steps happen under the write lock.
+  sync_mutex_lock(&c->wlock);
+  var rc: int32 = mtls_send_record_nl(c, MTLS_CT_HANDSHAKE, &m[0], 5);
   var secret: uint8* = &c->s_ap[0];
   if (c->is_client) { secret = &c->c_ap[0]; }
-  if (mtls13_next_secret(c, secret) != MTLS_OK) { return mtls_fail(c, MTLS_E_CRYPTO, MTLS_ALERT_INTERNAL_ERROR); }
-  mtls_dir_set13(&c->wr, &c->suite, secret);
+  if (rc == MTLS_OK) { rc = mtls13_next_secret(c, secret); }
+  if (rc == MTLS_OK) { rc = mtls_dir_set13(&c->wr, &c->suite, secret); }
+  sync_mutex_unlock(&c->wlock);
+  if (rc != MTLS_OK) { return mtls_fail(c, MTLS_E_CRYPTO, -1); }
   return MTLS_OK;
 }
 
@@ -126,6 +131,11 @@ fn mtls_on_alert(c: MtlsConn*, p: uint8*, n: int64) -> int32 {
   var desc: int32 = (int32)p[1];
   if (desc == MTLS_ALERT_CLOSE_NOTIFY) {
     c->peer_closed = true;
+    // Closing before the handshake is done is the peer giving up.
+    if (!c->hs_done) {
+      c->we_closed = true;
+      return mtls_fail(c, MTLS_E_CLOSED, -1);
+    }
     return MTLS_OK;
   }
   if (desc == MTLS_ALERT_USER_CANCELED && c->version == MTLS_TLS13) { return MTLS_OK; }

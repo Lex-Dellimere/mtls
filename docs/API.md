@@ -37,9 +37,25 @@ One config can serve many connections. Do not change it while they run.
 | `mtls_stream_server(&s, fd, &cfg)` | Server handshake on an accepted socket |
 | `mtls_stream_read(&s, buf, cap)` | Count, 0 at a clean end, `MTLS_E_EOF` if the peer closed without close_notify, or an error |
 | `mtls_stream_write(&s, p, n)`, `mtls_stream_write_str(&s, text)` | Sends everything; returns n or an error |
-| `mtls_stream_close(&s)` | close_notify, frees the connection, closes the socket if the stream owns it (`s.owns_fd`) |
+| `mtls_stream_shutdown(&s)` | close_notify and a socket shutdown, from any thread; wakes a blocked reader |
+| `mtls_stream_close(&s)` | close_notify, frees the connection, closes the socket if the stream owns it (`s.owns_fd`). No other thread may still be using it |
 | `s.c` | The `MtlsConn*`, for the info calls below |
 | `s.cert_error`, `s.alert_sent`, `s.alert_received` | Why `mtls_dial` failed |
+
+## Non-blocking sockets: `MtlsNb`
+
+For event loops (alph actors and tasks, epoll). See [nonblocking.md](nonblocking.md).
+
+| Call | Meaning |
+|---|---|
+| `mtls_nb_client(&t, fd, &cfg, host)`, `mtls_nb_server(&t, fd, &cfg)` | Start on a connected or accepted socket (made non-blocking) |
+| `mtls_nb_pump(&t)` | Call on each readiness event; advances the handshake |
+| `mtls_nb_wants(&t)` | `MTLS_NB_READ` (1) / `MTLS_NB_WRITE` (4), the alph and epoll values; 0 when finished |
+| `mtls_nb_handshaking(&t)` | Still shaking hands |
+| `mtls_nb_read(&t, buf, cap)` | Count, 0 at a clean end, `MTLS_E_WANT_IO`, `MTLS_E_EOF`, or an error |
+| `mtls_nb_write(&t, p, n)`, `mtls_nb_pending(&t)` | Queue and send; bytes still queued |
+| `mtls_nb_close(&t)` | Idempotent cleanup, fit for an exit hook; closes the socket only if `t.owns_fd` |
+| `t.c` | The `MtlsConn*`, for the info calls below |
 
 ## Connections without I/O: `MtlsConn`
 
@@ -112,7 +128,11 @@ Information: `mtls_conn_handshaking`, `mtls_conn_error`, `mtls_conn_version`,
 
 ## Threads
 
-A connection belongs to one thread at a time. A config, a trust store and
-a session cache may be shared by connections on many threads only if
-nobody changes them; the session cache is not locked, so give each thread
-its own or guard it.
+`MtlsConn` and `MtlsNb` belong to one thread at a time. An `MtlsStream`
+may be shared after the handshake: one thread reads while any number of
+threads write (each `mtls_stream_write` goes out whole). Stop with
+`mtls_stream_shutdown`, join the threads, then `mtls_stream_close`.
+
+A config, a trust store and a session cache may be shared by connections
+on many threads only if nobody changes them; the session cache is not
+locked, so give each thread its own or guard it.

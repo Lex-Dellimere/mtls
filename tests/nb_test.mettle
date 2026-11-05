@@ -1,0 +1,167 @@
+// MtlsNb over real loopback TCP: a non-blocking client and server in one
+// thread, driven only by poll() readiness, the way an event loop drives
+// them. Also checks that closing in the middle of a handshake is clean.
+
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "mtls/mtls";
+
+fn listen_any(port: int32*) -> int64 {
+  var a: NetAddr = net_addr_v4(127, 0, 0, 1, 0);
+  var lfd: int64 = -1;
+  match (tcp_listen(&a, 4)) {
+    case Ok(fd): { lfd = fd; }
+    case Err(e): { return -1; }
+  }
+  var got: NetAddr;
+  sock_local_addr(lfd, &got);
+  *port = got.port;
+  return lfd;
+}
+
+fn connect_pair(lfd: int64, port: int32, cfd: int64*, sfd: int64*) -> bool {
+  match (tcp_connect("127.0.0.1", port, 2000)) {
+    case Ok(fd): { *cfd = fd; }
+    case Err(e): { return false; }
+  }
+  var peer: NetAddr;
+  *sfd = sock_accept(lfd, &peer);
+  return *sfd >= 0;
+}
+
+// One poll round over both sides: pump whoever is ready.
+fn step(a: MtlsNb*, b: MtlsNb*) -> int32 {
+  var p: NetPollFd[2];
+  p[0].fd = a->fd;
+  p[0].events = (int32)mtls_nb_wants(a);
+  p[1].fd = b->fd;
+  p[1].events = (int32)mtls_nb_wants(b);
+  if (p[0].events == 0 && p[1].events == 0) { return 0; }
+  // Idle is fine: both sides may be waiting for the test to write more.
+  var r: int64 = sock_poll(&p[0], 2, 20);
+  if (r < 0) { return -1; }
+  if (r == 0) { return 0; }
+  if (p[0].revents != 0) { mtls_nb_pump(a); }
+  if (p[1].revents != 0) { mtls_nb_pump(b); }
+  return 1;
+}
+
+fn main() -> int32 {
+  var chain: string = import_str "data/tls/ecserver-chain.pem";
+  var key: string = import_str "data/tls/ecserver.key";
+  var root: string = import_str "data/tls/ecroot.pem";
+  var scfg: MtlsConfig;
+  mtls_config_init(&scfg);
+  if (mtls_config_set_cert_pem(&scfg, chain.chars, (int64)chain.length, key.chars, (int64)key.length) != MTLS_OK) { return 1; }
+  var roots: MtlsRoots;
+  mtls_roots_init(&roots);
+  mtls_roots_add_pem(&roots, root.chars, (int64)root.length);
+  var ccfg: MtlsConfig;
+  mtls_config_init(&ccfg);
+  ccfg.roots = &roots;
+
+  var port: int32 = 0;
+  var lfd: int64 = listen_any(&port);
+  if (lfd < 0) { return 2; }
+  var cfd: int64 = -1;
+  var sfd: int64 = -1;
+  if (!connect_pair(lfd, port, &cfd, &sfd)) { return 3; }
+  var c: MtlsNb;
+  var s: MtlsNb;
+  if (mtls_nb_client(&c, cfd, &ccfg, "server.test") != MTLS_OK) { return 4; }
+  if (mtls_nb_server(&s, sfd, &scfg) != MTLS_OK) { return 5; }
+  c.owns_fd = true;
+  s.owns_fd = true;
+  mtls_nb_pump(&c);
+  var guard: int32 = 0;
+  while ((mtls_nb_handshaking(&c) || mtls_nb_handshaking(&s)) && guard < 200) {
+    if (step(&c, &s) < 0) { return 6; }
+    guard = guard + 1;
+  }
+  if (mtls_conn_error(c.c) != 0 || mtls_conn_error(s.c) != 0 || !mtls_conn_peer_verified(c.c)) { return 7; }
+
+  // 200 KB each way through the echo, more than the socket buffers hold,
+  // so writes really do wait for MTLS_NB_WRITE.
+  var total: int64 = 204800;
+  var src: uint8* = (uint8*)malloc(total);
+  var back: uint8* = (uint8*)malloc(total);
+  for i in 0..total { src[i] = (uint8)((i * 31) & 255); }
+  var sent: int64 = 0;
+  var got: int64 = 0;
+  var buf: uint8[16384];
+  guard = 0;
+  while (got < total && guard < 100000) {
+    guard = guard + 1;
+    if (sent < total && mtls_nb_pending(&c) < 65536) {
+      var k: int64 = total - sent;
+      if (k > 16384) { k = 16384; }
+      if (mtls_nb_write(&c, src + sent, k) != k) { return 8; }
+      sent = sent + k;
+    }
+    // The server echoes whatever it reads.
+    while (true) {
+      var n: int64 = mtls_nb_read(&s, &buf[0], 16384);
+      if (n <= 0) { break; }
+      if (mtls_nb_write(&s, &buf[0], n) != n) { return 9; }
+    }
+    while (got < total) {
+      var n2: int64 = mtls_nb_read(&c, back + got, total - got);
+      if (n2 <= 0) { break; }
+      got = got + n2;
+    }
+    if (got < total && step(&c, &s) < 0) {
+      println("stuck: sent {sent} got {got} wants c={mtls_nb_wants(&c)} s={mtls_nb_wants(&s)} pend c={mtls_nb_pending(&c)} s={mtls_nb_pending(&s)} app c={c.c->applen - c.c->apppos} s={s.c->applen - s.c->apppos} in c={c.c->inlen} s={s.c->inlen} err {c.c->err} {s.c->err}");
+      return 10;
+    }
+  }
+  if (got != total || memcmp(src, back, total) != 0) { return 11; }
+  // Clean close: the server reads the end.
+  mtls_nb_close(&c);
+  guard = 0;
+  var endr: int64 = (int64)MTLS_E_WANT_IO;
+  while (endr == (int64)MTLS_E_WANT_IO && guard < 100) {
+    var p1: NetPollFd;
+    p1.fd = s.fd;
+    p1.events = NET_POLL_IN;
+    sock_poll(&p1, 1, 1000);
+    endr = mtls_nb_read(&s, &buf[0], 16384);
+    guard = guard + 1;
+  }
+  if (endr != 0) { return 12; }
+  mtls_nb_close(&s);
+  mtls_nb_close(&s);   // twice is fine
+
+  // Closing halfway through a handshake (an owner that crashed).
+  if (!connect_pair(lfd, port, &cfd, &sfd)) { return 13; }
+  var c2: MtlsNb;
+  var s2: MtlsNb;
+  mtls_nb_client(&c2, cfd, &ccfg, "server.test");
+  mtls_nb_server(&s2, sfd, &scfg);
+  c2.owns_fd = true;
+  s2.owns_fd = true;
+  mtls_nb_pump(&c2);
+  mtls_nb_close(&s2);   // the server side goes away before answering
+  for i in 0..5 {
+    if (mtls_nb_wants(&c2) == 0) { break; }
+    var p2: NetPollFd;
+    p2.fd = c2.fd;
+    p2.events = (int32)mtls_nb_wants(&c2);
+    sock_poll(&p2, 1, 200);
+    mtls_nb_pump(&c2);
+  }
+  // The client must notice: an error or the end of the socket, never "still fine".
+  if (mtls_nb_handshaking(&c2) || (!c2.eof && mtls_conn_error(c2.c) == 0)) {
+    return 14;
+  }
+  mtls_nb_close(&c2);
+  free(src);
+  free(back);
+  sock_close(lfd);
+  mtls_config_free(&scfg);
+  mtls_roots_free(&roots);
+  println("nb ok");
+  return 0;
+}

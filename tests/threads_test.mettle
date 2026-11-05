@@ -1,0 +1,148 @@
+// One MtlsStream shared by three threads: a reader and two writers, with
+// no lock of their own, against an echo server that keeps asking for key
+// updates (the reader answers those while the writers send). Every line
+// must come back whole, none lost, none mixed.
+
+import "std/io";
+import "std/mem";
+import "std/core";
+import "std/socket";
+import "std/netaddr";
+import "std/thread";
+import "mtls/mtls";
+
+const LINES = 400;          // per writer
+const LINE_LEN = 64;
+
+var g_scfg: MtlsConfig;
+var g_ccfg: MtlsConfig;
+var g_roots: MtlsRoots;
+var g_lfd: int64 = -1;
+var g_cli: MtlsStream;
+var g_bad: int32 = 0;
+var g_seen_a: int32 = 0;
+var g_seen_b: int32 = 0;
+
+fn line_for(who: int32, i: int32, out: uint8*) {
+  memset(out, (int32)'.', LINE_LEN);
+  out[0] = (uint8)who;
+  var v: int32 = i;
+  for k in 0..6 {
+    out[6 - k] = (uint8)(48 + v % 10);
+    v = v / 10;
+  }
+  out[LINE_LEN - 1] = 10;
+}
+
+// Echo server: one connection, asks for a key update every 50 reads.
+fn server_main(arg: cstring) -> uint32 {
+  var peer: NetAddr;
+  var fd: int64 = sock_accept(g_lfd, &peer);
+  var s: MtlsStream;
+  if (mtls_stream_server(&s, fd, &g_scfg) != MTLS_OK) { return 1; }
+  s.owns_fd = true;
+  var buf: uint8[8192];
+  var reads: int32 = 0;
+  while (true) {
+    var n: int64 = mtls_stream_read(&s, &buf[0], 8192);
+    if (n <= 0) { break; }
+    if (mtls_stream_write(&s, &buf[0], n) != n) { break; }
+    reads = reads + 1;
+    if (reads % 50 == 0) {
+      mtls_conn_key_update(s.c, true);
+      mtls_stream_flush(&s);
+    }
+  }
+  mtls_stream_close(&s);
+  return 0;
+}
+
+fn writer(who: int32) -> uint32 {
+  var line: uint8[64];
+  for i in 0..LINES {
+    line_for(who, i, &line[0]);
+    if (mtls_stream_write(&g_cli, &line[0], LINE_LEN) != (int64)LINE_LEN) { return 1; }
+    if (who == 65 && i == LINES / 2) { mtls_conn_key_update(g_cli.c, false); }
+  }
+  return 0;
+}
+
+fn writer_a(arg: cstring) -> uint32 { return writer(65); }
+fn writer_b(arg: cstring) -> uint32 { return writer(66); }
+
+fn reader_main(arg: cstring) -> uint32 {
+  var line: uint8[64];
+  var have: int32 = 0;
+  var buf: uint8[4096];
+  var want: uint8[64];
+  while (g_seen_a + g_seen_b < 2 * LINES) {
+    var n: int64 = mtls_stream_read(&g_cli, &buf[0], 4096);
+    if (n <= 0) { break; }
+    for i in 0..n {
+      line[have] = buf[i];
+      have = have + 1;
+      if (have == LINE_LEN) {
+        // A line must be exactly what one writer wrote, in its order.
+        var who: int32 = (int32)line[0];
+        var idx: int32 = g_seen_a;
+        if (who == 66) { idx = g_seen_b; }
+        line_for(who, idx, &want[0]);
+        if ((who != 65 && who != 66) || memcmp(&line[0], &want[0], LINE_LEN) != 0) { g_bad = g_bad + 1; }
+        if (who == 65) { g_seen_a = g_seen_a + 1; } else { g_seen_b = g_seen_b + 1; }
+        have = 0;
+      }
+    }
+  }
+  return 0;
+}
+
+fn spawn(f: fn(cstring) -> uint32) -> int64 {
+  var tid: uint32 = 0;
+  return CreateThread((cstring)0, 0, f, (cstring)0, 0, &tid);
+}
+
+fn main() -> int32 {
+  var chain: string = import_str "data/tls/ecserver-chain.pem";
+  var key: string = import_str "data/tls/ecserver.key";
+  var root: string = import_str "data/tls/ecroot.pem";
+  mtls_config_init(&g_scfg);
+  if (mtls_config_set_cert_pem(&g_scfg, chain.chars, (int64)chain.length, key.chars, (int64)key.length) != MTLS_OK) { return 1; }
+  mtls_roots_init(&g_roots);
+  mtls_roots_add_pem(&g_roots, root.chars, (int64)root.length);
+  mtls_config_init(&g_ccfg);
+  g_ccfg.roots = &g_roots;
+  g_ccfg.min_version = MTLS_TLS13;
+
+  var a: NetAddr = net_addr_v4(127, 0, 0, 1, 0);
+  match (tcp_listen(&a, 4)) {
+    case Ok(fd): { g_lfd = fd; }
+    case Err(e): { return 2; }
+  }
+  var got: NetAddr;
+  sock_local_addr(g_lfd, &got);
+  var srv: int64 = spawn(&server_main);
+  if (mtls_dial_name(&g_cli, "127.0.0.1", got.port, "server.test", &g_ccfg, 5000) != MTLS_OK) { return 3; }
+  var rd: int64 = spawn(&reader_main);
+  var wa: int64 = spawn(&writer_a);
+  var wb: int64 = spawn(&writer_b);
+  thread_join_infinite(wa);
+  thread_join_infinite(wb);
+  thread_join_infinite(rd);
+  // Stop: shutdown from this thread, then close once nobody uses it.
+  mtls_stream_shutdown(&g_cli);
+  mtls_stream_close(&g_cli);
+  thread_join_infinite(srv);
+  sock_close(g_lfd);
+  if (g_bad != 0) {
+    println("{g_bad} damaged lines");
+    return 4;
+  }
+  if (g_seen_a != LINES || g_seen_b != LINES) {
+    println("lines: {g_seen_a} + {g_seen_b}");
+    return 5;
+  }
+  mtls_config_free(&g_scfg);
+  mtls_roots_free(&g_roots);
+  println("threads ok");
+  return 0;
+}

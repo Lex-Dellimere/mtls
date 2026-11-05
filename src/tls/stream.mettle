@@ -5,12 +5,17 @@
 //   mtls_stream_write(&s, p, n); mtls_stream_read(&s, buf, cap);
 //   mtls_stream_close(&s);
 //
-// For an event loop (alph's reactor) use the MtlsConn calls directly, or
-// the mtls_stream_pump helpers on a non-blocking socket.
+// Threads: after the handshake, one thread may read while others write.
+// Reads are serialized with reads and each write call is sent whole, so
+// a reader thread, a heartbeat thread and a REPL thread can share one
+// stream without a lock of their own. To stop, call mtls_stream_shutdown
+// (wakes a blocked reader), join the other threads, then
+// mtls_stream_close. For an event loop use MtlsNb (tls/nb) instead.
 
 import "std/mem";
 import "std/core";
 import "std/socket";
+import "std/sync";
 import "mtls/core/err";
 import "mtls/tls/config";
 import "mtls/tls/conn";
@@ -21,6 +26,7 @@ export struct MtlsStream {
   fd: int64;
   c: MtlsConn*;
   owns_fd: bool;
+  rlock: SyncMutex;       // one reader at a time
   // Why mtls_dial failed, kept after the connection is freed.
   cert_error: int32;      // MTLS_CV_*
   alert_sent: int32;
@@ -30,6 +36,13 @@ export struct MtlsStream {
 /// mtls_stream_flush: sends everything queued. Waits on a non-blocking
 /// socket. Returns MTLS_OK or MTLS_E_IO.
 export fn mtls_stream_flush(s: MtlsStream*) -> int32 {
+  sync_mutex_lock(&s->c->wlock);
+  var rc: int32 = mtls_stream_flush_nl(s);
+  sync_mutex_unlock(&s->c->wlock);
+  return rc;
+}
+
+fn mtls_stream_flush_nl(s: MtlsStream*) -> int32 {
   var p: uint8* = (uint8*)0;
   var n: int64 = mtls_conn_out_peek(s->c, &p);
   while (n > 0) {
@@ -78,6 +91,10 @@ fn mtls_stream_init(s: MtlsStream*, fd: int64, c: MtlsConn*) -> int32 {
   s->fd = fd;
   s->c = c;
   s->owns_fd = false;
+  s->rlock.state = 0;
+  s->cert_error = 0;
+  s->alert_sent = -1;
+  s->alert_received = -1;
   if (c == 0) { return MTLS_E_NOMEM; }
   return MTLS_OK;
 }
@@ -102,6 +119,13 @@ export fn mtls_stream_server(s: MtlsStream*, fd: int64, cfg: MtlsConfig*) -> int
 /// count, 0 at a clean end, or a negative error (MTLS_E_EOF if the peer
 /// closed the socket without close_notify: the data may be cut short).
 export fn mtls_stream_read(s: MtlsStream*, dst: uint8*, cap: int64) -> int64 {
+  sync_mutex_lock(&s->rlock);
+  var r: int64 = mtls_stream_read_nl(s, dst, cap);
+  sync_mutex_unlock(&s->rlock);
+  return r;
+}
+
+fn mtls_stream_read_nl(s: MtlsStream*, dst: uint8*, cap: int64) -> int64 {
   while (true) {
     var r: int64 = mtls_conn_read(s->c, dst, cap);
     mtls_stream_flush(s);
@@ -118,17 +142,27 @@ export fn mtls_stream_read(s: MtlsStream*, dst: uint8*, cap: int64) -> int64 {
 }
 
 /// mtls_stream_write: sends all n bytes. Returns n or a negative error.
+/// The whole call holds the write lock, so writes from several threads
+/// never interleave.
 export fn mtls_stream_write(s: MtlsStream*, src: uint8*, n: int64) -> int64 {
+  var c: MtlsConn* = s->c;
+  if (c->err != 0) { return (int64)c->err; }
+  if (!c->hs_done) { return (int64)MTLS_E_STATE; }
+  if (n <= 0) { return 0; }
+  sync_mutex_lock(&c->wlock);
+  var r: int64 = n;
+  if (c->we_closed) { r = (int64)MTLS_E_CLOSED; }
   var done: int64 = 0;
-  while (done < n) {
+  while (r > 0 && done < n) {
     var k: int64 = n - done;
     if (k > 65536) { k = 65536; }
-    var r: int64 = mtls_conn_write(s->c, src + done, k);
-    if (r < 0) { return r; }
-    if (mtls_stream_flush(s) != MTLS_OK) { return (int64)MTLS_E_IO; }
-    done = done + r;
+    var rc: int32 = mtls_send_record_nl(c, MTLS_CT_APPDATA, src + done, k);
+    if (rc != MTLS_OK) { r = (int64)rc; }
+    if (r > 0 && mtls_stream_flush_nl(s) != MTLS_OK) { r = (int64)MTLS_E_IO; }
+    done = done + k;
   }
-  return n;
+  sync_mutex_unlock(&c->wlock);
+  return r;
 }
 
 /// mtls_stream_write_str: mtls_stream_write for a string.
@@ -136,8 +170,19 @@ export fn mtls_stream_write_str(s: MtlsStream*, text: string) -> int64 {
   return mtls_stream_write(s, text.chars, (int64)text.length);
 }
 
+/// mtls_stream_shutdown: sends close_notify and shuts the socket down both
+/// ways, so a thread blocked in mtls_stream_read returns. Any thread may
+/// call it; follow with mtls_stream_close once the others have stopped.
+export fn mtls_stream_shutdown(s: MtlsStream*) {
+  if (s->c == 0) { return; }
+  mtls_conn_close(s->c);
+  mtls_stream_flush(s);
+  if (s->fd >= 0) { sock_shutdown(s->fd, NET_SHUT_BOTH); }
+}
+
 /// mtls_stream_close: sends close_notify, frees the connection, and
-/// closes the socket if the stream owns it.
+/// closes the socket if the stream owns it. No other thread may be using
+/// the stream (see mtls_stream_shutdown).
 export fn mtls_stream_close(s: MtlsStream*) {
   if (s->c != 0) {
     mtls_conn_close(s->c);

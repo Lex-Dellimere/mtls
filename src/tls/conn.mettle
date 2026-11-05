@@ -7,6 +7,7 @@
 
 import "std/mem";
 import "std/time";
+import "std/sync";
 import "crypto/core/util";
 import "mtls/core/err";
 import "mtls/core/bytes";
@@ -178,6 +179,9 @@ export struct MtlsConn {
   empty_recs: int32;
   // the user-supplied context for the reactor wrappers
   user: rawptr;
+  // Guards the sending side (write keys and the output queue) so one
+  // thread can write while another reads; see mtls_send_record.
+  wlock: SyncMutex;
 }
 
 /// mtls_conn_alloc: a connection in its start state; 0 if out of memory.
@@ -274,6 +278,7 @@ export fn mtls_fail(c: MtlsConn*, code: int32, desc: int32) -> int32 {
   c->state = MTLS_ST_FAILED;
   if (desc >= 0 && !c->we_closed) {
     c->alert_sent = desc;
+    sync_mutex_lock(&c->wlock);
     // A TLS 1.3 client that already has handshake keys sends the alert
     // under them: the server reads only protected records by then.
     if (c->is_client && c->version == MTLS_TLS13 && c->rd.on && !c->wr.on) {
@@ -282,8 +287,9 @@ export fn mtls_fail(c: MtlsConn*, code: int32, desc: int32) -> int32 {
     var a: uint8[2];
     a[0] = 2;
     a[1] = (uint8)desc;
-    mtls_send_record(c, MTLS_CT_ALERT, &a[0], 2);
+    mtls_send_record_nl(c, MTLS_CT_ALERT, &a[0], 2);
     c->we_closed = true;
+    sync_mutex_unlock(&c->wlock);
   }
   mtls_wipe_secrets(c);
   return code;
@@ -363,17 +369,33 @@ export fn mtls_dir_wipe(d: MtlsDir*) {
 }
 
 /// mtls_send_record: queues data as records of the given type, split
-/// into 16 KiB fragments and protected with the current write keys.
+/// into 16 KiB fragments and protected with the current write keys. Takes
+/// the write lock, so a reading thread may send alerts and key-update
+/// answers while another thread writes.
 export fn mtls_send_record(c: MtlsConn*, ctype: int32, p: uint8*, n: int64) -> int32 {
+  sync_mutex_lock(&c->wlock);
+  var rc: int32 = mtls_send_record_nl(c, ctype, p, n);
+  sync_mutex_unlock(&c->wlock);
+  return rc;
+}
+
+// Records the first error without sending anything (safe under the lock).
+fn mtls_fail_quiet(c: MtlsConn*, code: int32) -> int32 {
+  if (c->err == 0) {
+    c->err = code;
+    c->fail_state = c->state;
+    c->state = MTLS_ST_FAILED;
+  }
+  return code;
+}
+
+/// mtls_send_record_nl: mtls_send_record for a caller that holds wlock.
+export fn mtls_send_record_nl(c: MtlsConn*, ctype: int32, p: uint8*, n: int64) -> int32 {
   var done: int64 = 0;
   while (done < n || (n == 0 && done == 0)) {
     var k: int64 = n - done;
     if (k > MTLS_MAX_PLAIN) { k = MTLS_MAX_PLAIN; }
-    if (!mtls_out_room(c, k + 5 + 8 + 1 + 16)) {
-      c->err = MTLS_E_NOMEM;
-      c->state = MTLS_ST_FAILED;
-      return MTLS_E_NOMEM;
-    }
+    if (!mtls_out_room(c, k + 5 + 8 + 1 + 16)) { return mtls_fail_quiet(c, MTLS_E_NOMEM); }
     var h: uint8* = c->out + c->outlen;
     var d: MtlsDir* = &c->wr;
     var ver: int32 = 0x0303;
@@ -393,7 +415,7 @@ export fn mtls_send_record(c: MtlsConn*, ctype: int32, p: uint8*, n: int64) -> i
       var nonce: uint8[12];
       mtls_nonce(d, &nonce[0]);
       if (mtls_aead_seal(&d->k, &nonce[0], h, 5, h + 5, k + 1, h + 5) != MTLS_OK) {
-        return mtls_fail(c, MTLS_E_CRYPTO, MTLS_ALERT_INTERNAL_ERROR);
+        return mtls_fail_quiet(c, MTLS_E_CRYPTO);
       }
     } else {
       // TLS 1.2: AD is seq || type || version || plaintext length.
@@ -418,13 +440,13 @@ export fn mtls_send_record(c: MtlsConn*, ctype: int32, p: uint8*, n: int64) -> i
       }
       if (k > 0) { memcpy(body, p + done, k); }
       if (mtls_aead_seal(&d->k, &nonce[0], &ad[0], 13, body, k, body) != MTLS_OK) {
-        return mtls_fail(c, MTLS_E_CRYPTO, MTLS_ALERT_INTERNAL_ERROR);
+        return mtls_fail_quiet(c, MTLS_E_CRYPTO);
       }
     }
     mtls_store16(h + 3, reclen);
     if (d->on) {
       d->seq = d->seq + 1;
-      if (d->seq == 0) { return mtls_fail(c, MTLS_E_PROTOCOL, -1); }
+      if (d->seq == 0) { return mtls_fail_quiet(c, MTLS_E_PROTOCOL); }
     }
     c->outlen = c->outlen + 5 + reclen;
     done = done + k;

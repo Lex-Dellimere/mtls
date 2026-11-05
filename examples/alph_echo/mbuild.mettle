@@ -1,0 +1,13 @@
+import "mbuild/api";
+
+// A TLS echo server and client as alph actors: every handshake and every
+// read and write is driven by readiness messages, never blocking a
+// scheduler thread. Needs alph checked out next to mtls.
+fn project() {
+  mb_package("mtls_alph_echo", "0.1.0");
+}
+
+fn deps() {
+  mb_dep_path("mtls", "../..");
+  mb_dep_path("alph", "../../../alph");
+}

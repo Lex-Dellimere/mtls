@@ -1,0 +1,294 @@
+// TLS over alph actors. An acceptor hands each connection to its own
+// session actor, which runs the TLS handshake and the echo with MtlsNb,
+// one readiness message at a time, so no scheduler thread ever blocks.
+// Each session sets an exit hook that frees its TLS state, so a session
+// that crashes or stops early leaks nothing.
+//
+// Two clients run against it: one sends lines and checks the echoes, the
+// other connects and hangs up in the middle of the handshake. The run
+// passes when the lines come back and both sessions' exit hooks ran.
+
+import "std/io";
+import "std/mem";
+import "alph/alph";
+import "mtls/mtls";
+
+const TAG_PORT: int64 = ALPH_TAG_USER;
+const TAG_DONE: int64 = ALPH_TAG_USER + 1;
+const LINES: int64 = 5;
+
+var g_scfg: MtlsConfig;
+var g_ccfg: MtlsConfig;
+var g_roots: MtlsRoots;
+var g_hooks: int64 = 0;   // session exit hooks run so far
+
+fn line_at(i: int64) -> string {
+  if (i == 0) { return "alpha\n"; }
+  if (i == 1) { return "beta\n"; }
+  if (i == 2) { return "gamma\n"; }
+  if (i == 3) { return "delta\n"; }
+  return "epsilon\n";
+}
+
+// Asks alph to wake this actor for what the TLS connection needs next.
+// MTLS_NB_READ / MTLS_NB_WRITE equal ALPH_IO_IN / ALPH_IO_OUT.
+fn arm(ctx: AlphCtx*, h: int64, t: MtlsNb*) -> bool {
+  var ev: int64 = mtls_nb_wants(t);
+  if (ev == 0) { return false; }
+  alph_io_arm(ctx, h, ev);
+  return true;
+}
+
+// ---- server ----
+
+struct Session {
+  h: int64;
+  tls: MtlsNb;
+  started: bool;
+}
+
+// Runs once when the session exits for any reason, crash included,
+// before alph closes the socket: free the TLS state here.
+fn session_exit(ctx: AlphCtx*, reason: int64) -> int64 {
+  var s: Session* = (Session*)ctx->state;
+  if (s->started) { mtls_nb_close(&s->tls); }
+  g_hooks = g_hooks + 1;
+  return 0;
+}
+
+fn session(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var s: Session* = (Session*)ctx->state;
+  if (m->tag == ALPH_TAG_IO_GIVEN) {
+    s->h = m->ref;
+    alph_on_exit(ctx, &session_exit);
+    // alph owns the socket (owns_fd stays false) and closes it at exit.
+    if (mtls_nb_server(&s->tls, alph_io_fd(ctx, s->h), &g_scfg) != MTLS_OK) {
+      return alph_stop(ctx, ALPH_NORMAL);
+    }
+    s->started = true;
+    arm(ctx, s->h, &s->tls);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != ALPH_TAG_IO) { return ALPH_CONTINUE; }
+  if (mtls_nb_pump(&s->tls) != MTLS_OK) { return alph_stop(ctx, ALPH_NORMAL); }
+  if (!mtls_nb_handshaking(&s->tls)) {
+    var buf: uint8[4096];
+    while (true) {
+      var n: int64 = mtls_nb_read(&s->tls, &buf[0], 4096);
+      if (n == (int64)MTLS_E_WANT_IO) { break; }
+      if (n <= 0) { return alph_stop(ctx, ALPH_NORMAL); }   // closed or broken
+      if (mtls_nb_write(&s->tls, &buf[0], n) != n) { return alph_stop(ctx, ALPH_NORMAL); }
+    }
+  }
+  if (!arm(ctx, s->h, &s->tls)) { return alph_stop(ctx, ALPH_NORMAL); }
+  return ALPH_CONTINUE;
+}
+
+struct Acceptor {
+  boss: int64;
+  listener: int64;
+  sup: int64;
+  asking: int64;
+  waiting: int64;
+}
+
+fn accept_next(ctx: AlphCtx*, a: Acceptor*) {
+  var h: int64 = alph_tcp_accept(ctx, a->listener);
+  if (h > 0) {
+    var s: Session;
+    memset((rawptr)&s, 0, (int64)sizeof(Session));
+    a->asking = alph_dyn_start_value<Session>(ctx, a->sup, &s, 1000);
+    if (a->asking > 0) {
+      a->waiting = h;
+      return;
+    }
+    alph_io_close(ctx, h);
+  }
+  alph_io_arm(ctx, a->listener, ALPH_IO_IN);
+}
+
+fn acceptor(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var a: Acceptor* = (Acceptor*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    a->boss = m->from;
+    a->listener = alph_tcp_listen(ctx, alph_ip4(127, 0, 0, 1), 0, 16, 0);
+    if (a->listener < 0) { return alph_stop(ctx, ALPH_REASON_USER); }
+    var spec: AlphDynSpec;
+    alph_dyn_init(&spec, &session);
+    spec.restart = ALPH_TEMPORARY;
+    a->sup = alph_spawn_dyn(ctx, &spec);
+    alph_send(ctx, a->boss, TAG_PORT, alph_tcp_port(ctx, a->listener));
+    alph_io_arm(ctx, a->listener, ALPH_IO_IN);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag == ALPH_TAG_IO && m->ref == a->listener) {
+    accept_next(ctx, a);
+    return ALPH_CONTINUE;
+  }
+  if (a->asking != 0 && m->ref == a->asking) {
+    var given: int64 = ALPH_GONE;
+    if (m->tag == ALPH_TAG_STARTED && m->arg != 0) {
+      given = alph_io_give(ctx, a->waiting, m->arg);
+    }
+    if (given != ALPH_SENT) { alph_io_close(ctx, a->waiting); }
+    a->asking = 0;
+    a->waiting = 0;
+    accept_next(ctx, a);
+  }
+  return ALPH_CONTINUE;
+}
+
+// ---- clients ----
+
+struct Client {
+  boss: int64;
+  port: int64;
+  h: int64;
+  quitter: bool;       // hang up during the handshake
+  tls: MtlsNb;
+  started: bool;
+  line: int64;
+  got: int64;
+  buf: uint8[16];
+}
+
+fn client_exit(ctx: AlphCtx*, reason: int64) -> int64 {
+  var c: Client* = (Client*)ctx->state;
+  if (c->started) { mtls_nb_close(&c->tls); }
+  return 0;
+}
+
+fn done(ctx: AlphCtx*, c: Client*, ok: bool, what: string) -> int64 {
+  if (!ok) { println("alph_echo: client failed: {what}"); }
+  var v: int64 = 0;
+  if (ok) { v = 1; }
+  alph_send(ctx, c->boss, TAG_DONE, v);
+  return alph_stop(ctx, ALPH_NORMAL);
+}
+
+fn send_line(c: Client*) -> bool {
+  var line: string = line_at(c->line);
+  return mtls_nb_write(&c->tls, line.chars, (int64)line.length) == (int64)line.length;
+}
+
+fn client(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var c: Client* = (Client*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    c->boss = m->from;
+    alph_on_exit(ctx, &client_exit);
+    c->h = alph_tcp_connect(ctx, alph_ip4(127, 0, 0, 1), c->port);
+    if (c->h < 0) { return done(ctx, c, false, "connect"); }
+    alph_io_arm(ctx, c->h, ALPH_IO_OUT);
+    return ALPH_CONTINUE;
+  }
+  if (m->tag != ALPH_TAG_IO) { return ALPH_CONTINUE; }
+  if (!c->started) {
+    if (alph_io_error(ctx, c->h) != 0) { return done(ctx, c, false, "connect"); }
+    if (mtls_nb_client(&c->tls, alph_io_fd(ctx, c->h), &g_ccfg, "server.test") != MTLS_OK) {
+      return done(ctx, c, false, "tls start");
+    }
+    c->started = true;
+    if (c->quitter) {
+      mtls_nb_pump(&c->tls);        // the ClientHello goes out...
+      return done(ctx, c, true, "");  // ...and the client walks away
+    }
+  }
+  if (mtls_nb_pump(&c->tls) != MTLS_OK) { return done(ctx, c, false, "handshake"); }
+  if (!mtls_nb_handshaking(&c->tls)) {
+    if (c->line == 0 && c->got == 0 && mtls_nb_pending(&c->tls) == 0 && !mtls_conn_peer_verified(c->tls.c)) {
+      return done(ctx, c, false, "server certificate not verified");
+    }
+    if (c->line == 0 && c->got == 0 && c->buf[15] == 0) {
+      c->buf[15] = 1;               // first time connected: send line 0
+      if (!send_line(c)) { return done(ctx, c, false, "write"); }
+    }
+    while (true) {
+      var line: string = line_at(c->line);
+      var want: int64 = (int64)line.length;
+      var n: int64 = mtls_nb_read(&c->tls, &c->buf[c->got], want - c->got);
+      if (n == (int64)MTLS_E_WANT_IO) { break; }
+      if (n <= 0) { return done(ctx, c, false, "closed early"); }
+      c->got = c->got + n;
+      if (c->got == want) {
+        if (memcmp(&c->buf[0], line.chars, want) != 0) { return done(ctx, c, false, "echo differs"); }
+        c->line = c->line + 1;
+        c->got = 0;
+        if (c->line == LINES) { return done(ctx, c, true, ""); }
+        if (!send_line(c)) { return done(ctx, c, false, "write"); }
+      }
+    }
+  }
+  if (!arm(ctx, c->h, &c->tls)) { return done(ctx, c, false, "connection ended"); }
+  return ALPH_CONTINUE;
+}
+
+// ---- boss ----
+
+struct Boss {
+  port: int64;
+  finished: int64;
+  ok: int64;
+  ticks: int64;
+}
+
+fn boss(ctx: AlphCtx*, m: AlphMsg*) -> int64 {
+  var b: Boss* = (Boss*)ctx->state;
+  if (m->tag == ALPH_TAG_INIT) {
+    alph_trap_exits(ctx, true);
+    var a: Acceptor;
+    memset((rawptr)&a, 0, (int64)sizeof(Acceptor));
+    alph_spawn_value<Acceptor>(ctx, ALPH_LINK, &a, &acceptor);
+  } else if (m->tag == TAG_PORT) {
+    b->port = m->arg;
+    for i in 0..2 {
+      var c: Client;
+      memset((rawptr)&c, 0, (int64)sizeof(Client));
+      c.port = m->arg;
+      c.quitter = i == 1;
+      alph_spawn_value<Client>(ctx, 0, &c, &client);
+    }
+  } else if (m->tag == TAG_DONE) {
+    b->finished = b->finished + 1;
+    b->ok = b->ok + m->arg;
+    if (b->finished == 2) { alph_send_after(ctx, 50, ctx->self, ALPH_TAG_USER + 2, 0); }
+  } else if (m->tag == ALPH_TAG_USER + 2) {
+    // Wait (briefly) until both server sessions have exited.
+    b->ticks = b->ticks + 1;
+    if (g_hooks < 2 && b->ticks < 100) {
+      alph_send_after(ctx, 50, ctx->self, ALPH_TAG_USER + 2, 0);
+      return ALPH_CONTINUE;
+    }
+    var pass: bool = b->ok == 2 && g_hooks == 2;
+    if (pass) {
+      println("alph_echo ok: {LINES} lines echoed over TLS, {g_hooks} session exit hooks ran");
+      alph_shutdown(ctx, 1000, 0);
+    } else {
+      println("alph_echo failed: clients ok {b->ok}/2, exit hooks {g_hooks}/2");
+      alph_shutdown(ctx, 1000, 1);
+    }
+  } else if (m->tag == ALPH_TAG_EXIT && m->from == 0) {
+    return alph_stop(ctx, m->arg);
+  }
+  return ALPH_CONTINUE;
+}
+
+var g_node: AlphNode;
+
+fn main() -> int32 {
+  var chain: string = import_str "../../tests/data/tls/ecserver-chain.pem";
+  var key: string = import_str "../../tests/data/tls/ecserver.key";
+  var root: string = import_str "../../tests/data/tls/ecroot.pem";
+  mtls_config_init(&g_scfg);
+  if (mtls_config_set_cert_pem(&g_scfg, chain.chars, (int64)chain.length, key.chars, (int64)key.length) != MTLS_OK) { return 2; }
+  mtls_roots_init(&g_roots);
+  mtls_roots_add_pem(&g_roots, root.chars, (int64)root.length);
+  mtls_config_init(&g_ccfg);
+  g_ccfg.roots = &g_roots;
+  var cfg: AlphConfig;
+  alph_config(&cfg);
+  if (!alph_node_start(&g_node, &cfg)) { return 1; }
+  var b: Boss;
+  memset((rawptr)&b, 0, (int64)sizeof(Boss));
+  alph_node_spawn_value<Boss>(&g_node, 0, &b, &boss);
+  return (int32)alph_node_wait(&g_node);
+}
